@@ -1,9 +1,27 @@
-<div align="center">
-
-# Q-learning with Adjoint Matching
-
+&nbsp;
+<div id="user-content-toc" style="margin-bottom: 40px;margin-top: 60px">
+  <ul align="center" style="list-style: none;">
+    <summary>
+      <h1> Q-learning with Adjoint Matching </h1>
+      <br>
+      <h2>[<a href="https://arxiv.org/pdf/xxxx.xxxxx">Paper</a>] &emsp;|&emsp; [<a href="https://colinqiyangli.github.io/qam">Website</a>]</h2>
+    </summary>
+  </ul>
 </div>
 
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="./assets/title-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/title-light.png">
+    <img alt="teaser figure" src="./assets/title-light.png" width="57.5%">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="./assets/bar-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/bar-light.png">
+    <img alt="bar plot" src="./assets/bar-light.png" width="41.8%">
+  </picture>
+</p>
 
 ## Overview
 Q-learning with adjoint matching (QAM) uses [Adjoint Matching](https://arxiv.org/abs/2409.08861) to fine-tune a flow policy towards the optimal behavior-regularized solution efficiently!
