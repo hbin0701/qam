@@ -13,12 +13,12 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="./assets/title-light.png">
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/title-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/title-dark.png">
     <img alt="teaser figure" src="./assets/title-light.png" width="57.5%">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="./assets/bar-light.png">
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/bar-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/bar-dark.png">
     <img alt="bar plot" src="./assets/bar-light.png" width="41.8%">
   </picture>
 </p>
