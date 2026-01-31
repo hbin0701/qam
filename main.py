@@ -57,24 +57,6 @@ def restore_csv_loggers(csv_loggers, save_dir):
         if os.path.exists(os.path.join(save_dir, f"{prefix}_sv.csv")):
             csv_logger.restore(os.path.join(save_dir, f"{prefix}_sv.csv"))
 
-def restore_buffer_env_state(restore_path):
-    buffer_dict = np.load(os.path.join(restore_path, "buffer.npz"))
-    buffer_dict = {k: buffer_dict[k] for k in buffer_dict.files}
-    pointer = buffer_dict.pop("pointer")
-    size = buffer_dict.pop("size")
-
-    state = {}
-
-    state["qpos"] = buffer_dict.pop("env_qpos")
-    state["qvel"] = buffer_dict.pop("env_qvel")
-
-    if "env_button_states" in buffer_dict:
-        state["button_states"] = buffer_dict.pop("env_button_states")
-    if "action_queue" in buffer_dict:
-        state["action_queue"] = buffer_dict.pop("action_queue")
-    
-    return ReplayBuffer(buffer_dict, pointer=pointer, size=size), state
-
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -194,18 +176,15 @@ def main(_):
             agent = restore_agent(agent, restore_path=FLAGS.save_dir, restore_epoch=load_step)
             restore_csv_loggers(csv_loggers, FLAGS.save_dir)
             assert load_stage == "offline", "online restoring is not supported"
-            replay_buffer, env_state = None, None
             success = True
         except:
             success = False
             load_stage = None
             load_step = None
-            replay_buffer = None
     else:
         success = False
         load_stage = None
         load_step = None
-        replay_buffer = None
 
     if not success: # if failed to load, start over
         print("failed to load prev run")
@@ -267,22 +246,21 @@ def main(_):
             
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
+            save_agent(agent, FLAGS.save_dir, log_step)
             save_csv_loggers(csv_loggers, FLAGS.save_dir)
-
             with open(os.path.join(FLAGS.save_dir, 'progress.tk'), 'w') as f:
                 f.write(f"offline,{i}")
 
     # transition from offline to online
-    if replay_buffer is None:
-        print(train_dataset.keys())
-        print(train_dataset["observations"].shape)
+    print(train_dataset.keys())
+    print(train_dataset["observations"].shape)
 
-        if not FLAGS.balanced_sampling:
-            replay_buffer = ReplayBuffer.create_from_initial_dataset(
-                dict(train_dataset), size=train_dataset.size + FLAGS.online_steps
-            )
-        else:
-            replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.online_steps)
+    if not FLAGS.balanced_sampling:
+        replay_buffer = ReplayBuffer.create_from_initial_dataset(
+            dict(train_dataset), size=train_dataset.size + FLAGS.online_steps
+        )
+    else:
+        replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.online_steps)
     
     action_dim = example_batch["actions"].shape[-1]
 
