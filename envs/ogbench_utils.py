@@ -101,6 +101,7 @@ def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, com
 
         if add_info:
             for k in info_keys:
+                dataset[f'next_{k}'] = dataset[k][next_ob_mask]
                 dataset[k] = dataset[k][ob_mask]
 
     return dataset
@@ -207,10 +208,10 @@ def make_ogbench_env_and_datasets(
     if not add_info:
         # Remove information keys.
         for k in ['qpos', 'qvel', 'button_states']:
-            if k in train_dataset:
-                del train_dataset[k]
-            if k in val_dataset:
-                del val_dataset[k]
+            for ds in [train_dataset, val_dataset]:
+                for key in [k, f'next_{k}']:
+                    if key in ds:
+                        del ds[key]
 
     if dataset_only:
         return train_dataset, val_dataset

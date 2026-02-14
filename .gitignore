@@ -7,4 +7,30 @@ dist/
 .DS_Store
 .idea/
 .ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Experiment outputs and local artifacts
 exp/
+artifacts/
+logs/
+wandb/
+*.log
+auto_run.log
+eval_success_plot.png
+
+# Local scratch test folders
+test_sparse/
+test_v1/
+test_v2/
+test_v3/

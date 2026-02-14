@@ -39,11 +39,36 @@ class QAMAgent(flax.struct.PyTreeNode):
         critic_loss = (jnp.square(q - target_q) * batch['valid'][..., -1]).mean()
 
         total_loss = critic_loss
+
+        # Debug: reward and target diagnostics
+        batch_rewards = batch['rewards'][..., -1]
+        batch_masks = batch['masks'][..., -1]
+        batch_valid = batch['valid'][..., -1]
+        bootstrap = (self.config['discount'] ** self.config["horizon_length"]) * batch_masks * next_q
+
         return total_loss, {
             'critic_loss': critic_loss,
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
+            # Reward diagnostics
+            'reward_mean': batch_rewards.mean(),
+            'reward_std': batch_rewards.std(),
+            'reward_min': batch_rewards.min(),
+            'reward_max': batch_rewards.max(),
+            'reward_nonzero_frac': (batch_rewards != 0).mean(),
+            # Target diagnostics
+            'target_q_mean': target_q.mean(),
+            'target_q_std': target_q.std(),
+            'target_q_min': target_q.min(),
+            'target_q_max': target_q.max(),
+            # Bootstrap diagnostics
+            'bootstrap_mean': bootstrap.mean(),
+            'next_q_mean': next_q.mean(),
+            'next_q_std': next_q.std(),
+            # Mask diagnostics
+            'mask_mean': batch_masks.mean(),
+            'valid_mean': batch_valid.mean(),
         }
     
     @partial(jax.jit, static_argnames=("flow_steps"))

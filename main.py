@@ -5,6 +5,7 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
+from envs.rewards.cube_dense_reward import DenseRewardWrapper
 
 from utils.flax_utils import save_agent, restore_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -20,6 +21,8 @@ flags.DEFINE_string('tags', 'Default', 'Wandb tag.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
+flags.DEFINE_string('run_name', None, 'Human readable run name for wandb and saving.')
+flags.DEFINE_string('project', 'qam-reproduce', 'Wandb project name.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('online_steps', 500000, 'Number of online steps.')
@@ -48,6 +51,9 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 1.0, 'Terminal success bonus multiplier for transition-delta rewards (v4/v5).')
+
 def save_csv_loggers(csv_loggers, save_dir):
     for prefix, csv_logger in csv_loggers.items():
         csv_logger.save(os.path.join(save_dir, f"{prefix}_sv.csv"))
@@ -71,17 +77,27 @@ class LoggingHelper:
 
 def main(_):
     exp_name = get_exp_name(FLAGS)
-    run = setup_wandb(project='qam-reproduce', group=FLAGS.run_group, name=exp_name, tags=FLAGS.tags.split(","))
-    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
+    run_name = FLAGS.run_name if FLAGS.run_name is not None else exp_name
+    run = setup_wandb(project=FLAGS.project, group=FLAGS.run_group, name=run_name, tags=FLAGS.tags.split(","))
+    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, run_name)
     
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
         # custom ogbench dataset
-        assert FLAGS.dataset_replace_interval != 0
+        # assert FLAGS.dataset_replace_interval != 0
         # assert FLAGS.dataset_proportion == 1.0
         dataset_idx = 0
+        # Detect env_type (single/double/triple/...) for dataset filtering
+        _env_type_filter = None
+        for _et in ['single', 'double', 'triple', 'quadruple', 'octuple']:
+            if f'{_et}-play' in FLAGS.env_name:
+                _env_type_filter = _et
+                break
         dataset_paths = [
-            file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz")) if '-val.npz' not in file
+            file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz"))
+            if '-val.npz' not in file
+            and (('visual' in FLAGS.env_name) == ('visual' in os.path.basename(file)))
+            and (_env_type_filter is None or f'-{_env_type_filter}-' in os.path.basename(file))
         ]
 
         if FLAGS.dataset_proportion < 1.:
@@ -94,6 +110,7 @@ def main(_):
             FLAGS.env_name,
             dataset_path=dataset_paths[dataset_idx],
             compact_dataset=False,
+            add_info=(FLAGS.dense_reward_version is not None),  # Load qpos/qvel for dense rewards
         )
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
@@ -108,12 +125,23 @@ def main(_):
     discount = FLAGS.agent.discount
     config["horizon_length"] = FLAGS.horizon_length
 
+    # Dense reward wrapper
+    dense_wrapper = None
+    if FLAGS.dense_reward_version is not None:
+        print(f"Using dense reward version: {FLAGS.dense_reward_version}")
+        dense_wrapper = DenseRewardWrapper(
+            task_name=FLAGS.env_name,
+            version=FLAGS.dense_reward_version,
+            debug=False
+        )
+
     # handle dataset
     def process_train_dataset(ds):
         """
         Process the train dataset to 
             - handle dataset proportion
             - handle sparse reward
+            - handle dense reward (if enabled)
             - convert to action chunked dataset
         """
 
@@ -130,6 +158,21 @@ def main(_):
             ds_dict = {k: v for k, v in ds.items()}
             ds_dict["rewards"] = sparse_rewards
             ds = Dataset.create(**ds_dict)
+        elif dense_wrapper is not None:
+            print(f"Computing dense rewards ({FLAGS.dense_reward_version})...")
+            if 'qpos' not in ds:
+                raise ValueError("Dense rewards require 'qpos' data. Load dataset with add_info=True")
+            dense_rewards = dense_wrapper.compute_dataset_rewards(
+                ds,
+                discount=FLAGS.agent.discount,
+                terminal_bonus=FLAGS.terminal_bonus,
+            )
+
+            ds_dict = {k: v for k, v in ds.items()}
+            ds_dict["rewards"] = dense_rewards
+            ds = Dataset.create(**ds_dict)
+            print(f"Dense rewards: mean={dense_rewards.mean():.4f}, "
+                  f"min={dense_rewards.min():.4f}, max={dense_rewards.max():.4f}")
 
         return ds
     
@@ -217,6 +260,7 @@ def main(_):
                 compact_dataset=False,
                 dataset_only=True,
                 cur_env=env,
+                add_info=(FLAGS.dense_reward_version is not None),  # Load qpos/qvel for dense rewards
             )
             train_dataset = process_train_dataset(train_dataset)
 
@@ -234,7 +278,7 @@ def main(_):
         if i == FLAGS.offline_steps or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
             # during eval, the action chunk is executed fully
-            eval_info, _, _ = evaluate(
+            eval_info, _, renders = evaluate(
                 agent=agent,
                 env=eval_env,
                 action_dim=example_batch["actions"].shape[-1],
@@ -243,6 +287,12 @@ def main(_):
                 video_frame_skip=FLAGS.video_frame_skip,
             )
             logger.log(eval_info, "eval", step=log_step)
+            if len(renders) > 0:
+                from log_utils import get_wandb_video
+                video = get_wandb_video(renders)
+                logger.wandb_logger.log({'eval/video': video}, step=log_step)
+            
+            print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
             
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
@@ -255,9 +305,14 @@ def main(_):
     print(train_dataset.keys())
     print(train_dataset["observations"].shape)
 
+    # Strip keys not needed for online training (e.g. qpos, qvel from dense reward datasets)
+    # to avoid memory waste and key mismatch in replay buffer add_transition.
+    online_keys = {'observations', 'actions', 'rewards', 'terminals', 'masks', 'next_observations'}
+    online_dataset = {k: v for k, v in train_dataset.items() if k in online_keys}
+
     if not FLAGS.balanced_sampling:
         replay_buffer = ReplayBuffer.create_from_initial_dataset(
-            dict(train_dataset), size=train_dataset.size + FLAGS.online_steps
+            online_dataset, size=train_dataset.size + FLAGS.online_steps
         )
     else:
         replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.online_steps)
@@ -268,6 +323,10 @@ def main(_):
     update_info = {}
     action_queue = [] # for action chunking
     ob, _ = env.reset()
+
+    # Previous state for wrapper-based dense online rewards.
+    prev_qpos_dense = env.unwrapped._data.qpos.copy() if dense_wrapper is not None else None
+    gamma = FLAGS.agent.discount
 
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step = FLAGS.offline_steps + i
@@ -282,6 +341,7 @@ def main(_):
                 compact_dataset=False,
                 dataset_only=True,
                 cur_env=env,
+                add_info=(FLAGS.dense_reward_version is not None),
             )
             train_dataset = process_train_dataset(train_dataset)
             size = train_dataset.size
@@ -320,6 +380,18 @@ def main(_):
         if FLAGS.sparse:
             assert int_reward <= 0.0
             int_reward = (int_reward != 0.0) * -1.0
+        elif dense_wrapper is not None:
+            curr_qpos_dense = env.unwrapped._data.qpos.copy()
+            int_reward = dense_wrapper.compute_online_reward(
+                prev_qpos=prev_qpos_dense,
+                curr_qpos=curr_qpos_dense,
+                env_reward=float(int_reward),
+                prev_ob=ob,
+                curr_ob=next_ob,
+                discount=gamma,
+                terminal_bonus=FLAGS.terminal_bonus,
+            )
+            prev_qpos_dense = curr_qpos_dense
 
         transition = dict(
             observations=ob,
@@ -335,6 +407,8 @@ def main(_):
         if done:
             ob, _ = env.reset()
             action_queue = []  # reset the action queue
+            if dense_wrapper is not None:
+                prev_qpos_dense = env.unwrapped._data.qpos.copy()
         else:
             ob = next_ob
 
@@ -368,7 +442,7 @@ def main(_):
 
         if i == FLAGS.online_steps or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
-            eval_info, _, _ = evaluate(
+            eval_info, _, renders = evaluate(
                 agent=agent,
                 env=eval_env,
                 action_dim=action_dim,
@@ -377,6 +451,12 @@ def main(_):
                 video_frame_skip=FLAGS.video_frame_skip,
             )
             logger.log(eval_info, "eval", step=log_step)
+            if len(renders) > 0:
+                from log_utils import get_wandb_video
+                video = get_wandb_video(renders)
+                logger.wandb_logger.log({'eval/video': video}, step=log_step)
+            
+            print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
 
     for key, csv_logger in logger.csv_loggers.items():
         csv_logger.close()

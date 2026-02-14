@@ -68,8 +68,12 @@ class Dataset(FrozenDict):
                 masks[..., i] = np.minimum(masks[..., i-1], self["masks"][cur_idxs]) * valid[..., i] + masks[..., i-1] * (1. - valid[..., i])
                 terminals[..., i] = np.maximum(terminals[..., i-1], self["terminals"][cur_idxs])
             
+            valid_mask = valid[..., i:i+1]
+            while valid_mask.ndim < self['next_observations'][cur_idxs].ndim:
+                valid_mask = valid_mask[..., None]
+            
             actions[..., i, :] = self['actions'][cur_idxs]
-            next_observations[..., i, :] = self['next_observations'][cur_idxs] * valid[..., i:i+1] + next_observations[..., i-1, :] * (1. - valid[..., i:i+1])
+            next_observations[..., i, :] = self['next_observations'][cur_idxs] * valid_mask + next_observations[..., i-1, :] * (1. - valid_mask)
             observations[..., i, :] = self['observations'][cur_idxs]
             
         return dict(
