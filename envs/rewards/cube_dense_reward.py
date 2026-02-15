@@ -10,6 +10,7 @@ Reward versions:
 - v3: Detailed stage tracking (reach -> grasp -> carry -> place per cube)
 - v4: Direct v2-delta (reward = v2(s') - v2(s) + gamma * success_bonus)
 - v5: Potential-based v3 (reward = Φ_v3(s') - Φ_v3(s))
+- v6: Pick-place style progress-delta (4 subtasks per cube) + terminal bonus
 """
 
 import re
@@ -28,6 +29,15 @@ CUBE_SUCCESS_THRESHOLD = 0.04
 # Approximate gripper home: center of OGBench arm_sampling_bounds
 # [[0.25, -0.35, 0.20], [0.6, 0.35, 0.35]]
 GRIPPER_HOME = np.array([0.425, 0.0, 0.275])
+# Tuned for OGBench cube task2 datasets (double/triple):
+# - Typical gripper-cube median distance is around 0.14-0.19.
+# - Typical "closed" gripper width is around 0.027 (so 0.02 is too strict).
+V6_REACH_THRESHOLD = 0.10
+V6_GOAL_APPROACH_THRESHOLD = 0.09
+V6_GRIPPER_OPEN_WIDTH = 0.08
+V6_GRASP_WIDTH_THRESHOLD = 0.045
+V6_GRASP_LIFT_THRESHOLD = 0.008
+V6_GRASP_LIFT_TARGET = 0.02
 
 
 def compute_cube_order(init_positions: np.ndarray, reference: np.ndarray = GRIPPER_HOME) -> List[int]:
@@ -296,6 +306,74 @@ def progress_v3(env: CubeEnvModel) -> Tuple[float, int]:
     return (total, stage)
 
 
+def progress_v6(env: CubeEnvModel) -> Tuple[float, int]:
+    """Pick-place style progress for sequential cube placement.
+
+    For the active cube (first incomplete in fixed cube_order), progress is split
+    into 4 subtasks, each worth 0.25:
+      0. move-to-object
+      1. grasp-object
+      2. move-to-goal
+      3. release-object
+
+    Total range: [0, num_cubes].
+    """
+    n = env.num_cubes
+
+    active_idx = None
+    order_pos = 0
+    for pos, idx in enumerate(env.cube_order):
+        if not env.cubes[idx].is_at_goal():
+            active_idx = idx
+            order_pos = pos
+            break
+
+    if active_idx is None:
+        return (float(n), n * 4 - 1)
+
+    cube = env.cubes[active_idx]
+    cube_goal_dist = cube.distance_to_goal()
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    gripper_open = float(np.clip(env.gripper_width / V6_GRIPPER_OPEN_WIDTH, 0.0, 1.0))
+    # Use v6-specific grasp condition (less strict than env.is_grasped()).
+    grasped = (env.gripper_width < V6_GRASP_WIDTH_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+
+    gripper_dist = None
+    if env.gripper_pos is not None:
+        gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+
+    # Determine subtask index following pick-place semantics.
+    if gripper_dist is not None and (gripper_dist > V6_REACH_THRESHOLD) and (not grasped):
+        subtask_idx = 0  # move to object
+    elif not grasped:
+        subtask_idx = 1  # grasp object
+    elif cube_goal_dist > V6_GOAL_APPROACH_THRESHOLD:
+        subtask_idx = 2  # move to goal
+    else:
+        subtask_idx = 3  # release object
+
+    # Compute normalized sub-progress for the active subtask.
+    if subtask_idx == 0:
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_reach_dist = max(init_reach_dist, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
+    elif subtask_idx == 1:
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
+        close_progress = float(np.clip((V6_GRIPPER_OPEN_WIDTH - env.gripper_width) / V6_GRIPPER_OPEN_WIDTH, 0.0, 1.0))
+        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+    elif subtask_idx == 2:
+        init_goal_dist = float(np.linalg.norm(cube.initial_position - cube.goal_position))
+        init_goal_dist = max(init_goal_dist, 1e-6)
+        subprogress = float(np.clip(1.0 - (cube_goal_dist / init_goal_dist), 0.0, 1.0))
+    else:
+        subprogress = gripper_open
+
+    main_progress = float(order_pos) + (float(subtask_idx) + float(np.clip(subprogress, 0.0, 1.0))) / 4.0
+    stage = order_pos * 4 + subtask_idx
+    return (main_progress, stage)
+
+
 # ============================================================
 # Unified DenseRewardWrapper
 # ============================================================
@@ -305,6 +383,7 @@ PROGRESS_FNS = {
     'v3': progress_v3,
     'v4': progress_v4,  # Potential-based version of v2
     'v5': progress_v3,  # Potential-based version of v3
+    'v6': progress_v6,  # Pick-place style delta shaping
 }
 
 
@@ -343,14 +422,14 @@ class DenseRewardWrapper:
         self.goal_positions = TASK_GOALS[key]
         self.init_positions = TASK_INITS.get(key)
 
-        # Precompute cube ordering for v3/v5: nearest cube to gripper home goes first
+        # Precompute cube ordering for v3/v5/v6: nearest cube to gripper home goes first
         if self.init_positions is not None:
             self.cube_order = compute_cube_order(self.init_positions)
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -361,7 +440,7 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5'):
+        if self.version in ('v3', 'v5', 'v6'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
@@ -373,7 +452,7 @@ class DenseRewardWrapper:
         - other versions keep centered form, range [-num_cubes, 0].
         """
         progress, _ = self.compute_progress(qpos, qvel, gripper_pos)
-        if self.version in ('v2', 'v3'):
+        if self.version in ('v2', 'v3', 'v6'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
@@ -394,38 +473,43 @@ class DenseRewardWrapper:
             raise ValueError(f"{ctx} requires keys: {missing}")
 
     def _success_bonus(self, env_reward: float, terminal_bonus: float) -> float:
-        return float(env_reward != 0.0) * terminal_bonus
+        # OGBench single-task rewards are 0 on success and negative otherwise.
+        # Apply terminal bonus only on true completion transitions.
+        return (terminal_bonus if abs(float(env_reward)) <= 1e-8 else 0.0)
 
-    def compute_v1_dataset_rewards(self, ds: Dict[str, np.ndarray], **_) -> np.ndarray:
-        self._require_keys(ds, ['qpos'], "v1")
+    def compute_v1_dataset_rewards(self, ds: Dict[str, np.ndarray], terminal_bonus: float = 50.0, **_) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'rewards'], "v1")
         qpos_data = ds['qpos']
         qvel_data = ds.get('qvel', None)
+        env_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
-            out[i] = self.compute_potential(qpos_data[i], qvel)
+            out[i] = self.compute_potential(qpos_data[i], qvel) + self._success_bonus(env_rewards[i], terminal_bonus)
         return out
 
-    def compute_v2_dataset_rewards(self, ds: Dict[str, np.ndarray], **_) -> np.ndarray:
-        self._require_keys(ds, ['qpos'], "v2")
+    def compute_v2_dataset_rewards(self, ds: Dict[str, np.ndarray], terminal_bonus: float = 50.0, **_) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'rewards'], "v2")
         qpos_data = ds['qpos']
         qvel_data = ds.get('qvel', None)
+        env_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
-            out[i] = self.compute_potential(qpos_data[i], qvel)
+            out[i] = self.compute_potential(qpos_data[i], qvel) + self._success_bonus(env_rewards[i], terminal_bonus)
         return out
 
-    def compute_v3_dataset_rewards(self, ds: Dict[str, np.ndarray], **_) -> np.ndarray:
-        self._require_keys(ds, ['qpos'], "v3")
+    def compute_v3_dataset_rewards(self, ds: Dict[str, np.ndarray], terminal_bonus: float = 50.0, **_) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'rewards'], "v3")
         qpos_data = ds['qpos']
         qvel_data = ds.get('qvel', None)
         obs_data = ds.get('observations', None)
+        env_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
             gp = extract_gripper_pos(obs_data[i]) if obs_data is not None else None
-            out[i] = self.compute_potential(qpos_data[i], qvel, gripper_pos=gp)
+            out[i] = self.compute_potential(qpos_data[i], qvel, gripper_pos=gp) + self._success_bonus(env_rewards[i], terminal_bonus)
         return out
 
     def compute_v4_dataset_rewards(self, ds: Dict[str, np.ndarray], discount: float = 0.99, terminal_bonus: float = 1.0) -> np.ndarray:
@@ -441,7 +525,7 @@ class DenseRewardWrapper:
             next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
             curr_progress, _ = self.compute_progress(qpos_data[i], qvel)
             next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel)
-            out[i] = (next_progress - curr_progress) + discount * self._success_bonus(env_rewards[i], terminal_bonus)
+            out[i] = (next_progress - curr_progress) + self._success_bonus(env_rewards[i], terminal_bonus)
         return out
 
     def compute_v5_dataset_rewards(self, ds: Dict[str, np.ndarray], discount: float = 0.99, terminal_bonus: float = 1.0) -> np.ndarray:
@@ -450,14 +534,38 @@ class DenseRewardWrapper:
         qvel_data = ds.get('qvel', None)
         next_qpos_data = ds['next_qpos']
         next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
         env_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
             next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
-            curr_progress, _ = self.compute_progress(qpos_data[i], qvel)
-            next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel)
-            out[i] = (next_progress - curr_progress) + discount * self._success_bonus(env_rewards[i], terminal_bonus)
+            gp = extract_gripper_pos(obs_data[i]) if obs_data is not None else None
+            next_gp = extract_gripper_pos(next_obs_data[i]) if next_obs_data is not None else None
+            curr_progress, _ = self.compute_progress(qpos_data[i], qvel, gripper_pos=gp)
+            next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
+            out[i] = (next_progress - curr_progress) + self._success_bonus(env_rewards[i], terminal_bonus)
+        return out
+
+    def compute_v6_dataset_rewards(self, ds: Dict[str, np.ndarray], discount: float = 0.99, terminal_bonus: float = 1.0) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v6")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        env_rewards = ds['rewards']
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            gp = extract_gripper_pos(obs_data[i]) if obs_data is not None else None
+            next_gp = extract_gripper_pos(next_obs_data[i]) if next_obs_data is not None else None
+            curr_progress, _ = self.compute_progress(qpos_data[i], qvel, gripper_pos=gp)
+            next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
+            out[i] = (next_progress - curr_progress) + self._success_bonus(env_rewards[i], terminal_bonus)
         return out
 
     def compute_dataset_rewards(
@@ -477,17 +585,40 @@ class DenseRewardWrapper:
             return self.compute_v4_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
         if self.version == 'v5':
             return self.compute_v5_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+        if self.version == 'v6':
+            return self.compute_v6_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
         raise ValueError(f"Unknown version for dataset rewards: {self.version}")
 
-    def compute_v1_online_reward(self, curr_qpos: np.ndarray, curr_ob: Optional[np.ndarray] = None, **_) -> float:
-        return float(self.compute_potential(curr_qpos))
+    def compute_v1_online_reward(
+        self,
+        curr_qpos: np.ndarray,
+        env_reward: float = 0.0,
+        curr_ob: Optional[np.ndarray] = None,
+        terminal_bonus: float = 50.0,
+        **_,
+    ) -> float:
+        return float(self.compute_potential(curr_qpos) + self._success_bonus(env_reward, terminal_bonus))
 
-    def compute_v2_online_reward(self, curr_qpos: np.ndarray, curr_ob: Optional[np.ndarray] = None, **_) -> float:
-        return float(self.compute_potential(curr_qpos))
+    def compute_v2_online_reward(
+        self,
+        curr_qpos: np.ndarray,
+        env_reward: float = 0.0,
+        curr_ob: Optional[np.ndarray] = None,
+        terminal_bonus: float = 50.0,
+        **_,
+    ) -> float:
+        return float(self.compute_potential(curr_qpos) + self._success_bonus(env_reward, terminal_bonus))
 
-    def compute_v3_online_reward(self, curr_qpos: np.ndarray, curr_ob: Optional[np.ndarray] = None, **_) -> float:
+    def compute_v3_online_reward(
+        self,
+        curr_qpos: np.ndarray,
+        env_reward: float = 0.0,
+        curr_ob: Optional[np.ndarray] = None,
+        terminal_bonus: float = 50.0,
+        **_,
+    ) -> float:
         gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
-        return float(self.compute_potential(curr_qpos, gripper_pos=gp))
+        return float(self.compute_potential(curr_qpos, gripper_pos=gp) + self._success_bonus(env_reward, terminal_bonus))
 
     def compute_v4_online_reward(
         self,
@@ -500,7 +631,7 @@ class DenseRewardWrapper:
     ) -> float:
         prev_progress, _ = self.compute_progress(prev_qpos)
         curr_progress, _ = self.compute_progress(curr_qpos)
-        return float((curr_progress - prev_progress) + discount * self._success_bonus(env_reward, terminal_bonus))
+        return float((curr_progress - prev_progress) + self._success_bonus(env_reward, terminal_bonus))
 
     def compute_v5_online_reward(
         self,
@@ -513,9 +644,28 @@ class DenseRewardWrapper:
         terminal_bonus: float = 1.0,
         **_,
     ) -> float:
-        prev_progress, _ = self.compute_progress(prev_qpos)
-        curr_progress, _ = self.compute_progress(curr_qpos)
-        return float((curr_progress - prev_progress) + discount * self._success_bonus(env_reward, terminal_bonus))
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+        prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
+        curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
+        return float((curr_progress - prev_progress) + self._success_bonus(env_reward, terminal_bonus))
+
+    def compute_v6_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+        prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
+        curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
+        return float((curr_progress - prev_progress) + self._success_bonus(env_reward, terminal_bonus))
 
     def compute_online_reward(
         self,
@@ -529,11 +679,29 @@ class DenseRewardWrapper:
     ) -> float:
         """Compute dense reward for an online transition via version-specific handlers."""
         if self.version == 'v1':
-            return self.compute_v1_online_reward(curr_qpos=curr_qpos, curr_ob=curr_ob, discount=discount, terminal_bonus=terminal_bonus)
+            return self.compute_v1_online_reward(
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+            )
         if self.version == 'v2':
-            return self.compute_v2_online_reward(curr_qpos=curr_qpos, curr_ob=curr_ob, discount=discount, terminal_bonus=terminal_bonus)
+            return self.compute_v2_online_reward(
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+            )
         if self.version == 'v3':
-            return self.compute_v3_online_reward(curr_qpos=curr_qpos, curr_ob=curr_ob, discount=discount, terminal_bonus=terminal_bonus)
+            return self.compute_v3_online_reward(
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+            )
         if self.version == 'v4':
             return self.compute_v4_online_reward(
                 prev_qpos=prev_qpos,
@@ -544,6 +712,16 @@ class DenseRewardWrapper:
             )
         if self.version == 'v5':
             return self.compute_v5_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+            )
+        if self.version == 'v6':
+            return self.compute_v6_online_reward(
                 prev_qpos=prev_qpos,
                 curr_qpos=curr_qpos,
                 env_reward=env_reward,
