@@ -72,7 +72,7 @@ def fetch_rows(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download and plot W&B eval/success data.")
     parser.add_argument("--entity", default="hbin0701")
-    parser.add_argument("--project", default="qam-reproduce-final")
+    parser.add_argument("--project", default="qam-reproduce-final-v3")
     parser.add_argument("--metric", default="eval/success")
     parser.add_argument("--out-dir", default="artifacts/wandb_eval_success")
     parser.add_argument("--max-runs", type=int, default=None)

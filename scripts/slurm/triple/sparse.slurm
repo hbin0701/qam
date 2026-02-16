@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=qam_triple_v5_8
+#SBATCH --job-name=qam_triple_sparse
 #SBATCH --partition=rlwrld
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/slurm/triple_v5_8_%j.out
-#SBATCH --error=logs/slurm/triple_v5_8_%j.err
+#SBATCH --output=logs/slurm/triple_sparse_%j.out
+#SBATCH --error=logs/slurm/triple_sparse_%j.err
 
 set -euo pipefail
 
@@ -27,4 +27,4 @@ export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
 export CUDA_VISIBLE_DEVICES=0
 export MUJOCO_EGL_DEVICE_ID=0
 
-bash scripts/triple/run_task2_dense_v5.sh
+bash scripts/triple/run_task2_sparse.sh

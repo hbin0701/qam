@@ -6,8 +6,8 @@ export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 
 MUJOCO_GL=egl python main.py \
     --run_group=double_task2_rewards \
-    --project=project-v4 \
-    --run_name=DOUBLE_QAM_EDIT_V1.7_Seed10001 \
+    --project=project-qam-v5 \
+    --run_name=DOUBLE_QAM_EDIT_V1.8_Seed10001 \
     --agent=agents/qam.py \
     --tags=QAM_EDIT,dense_v1 \
     --seed=10001 \

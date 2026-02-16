@@ -53,6 +53,7 @@ flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online re
 
 flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6), None for original rewards')
 flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v6).')
+flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
 
 def save_csv_loggers(csv_loggers, save_dir):
     for prefix, csv_logger in csv_loggers.items():
@@ -166,6 +167,7 @@ def main(_):
                 ds,
                 discount=FLAGS.agent.discount,
                 terminal_bonus=FLAGS.terminal_bonus,
+                shaping_coef=FLAGS.dense_shaping_lambda,
             )
 
             ds_dict = {k: v for k, v in ds.items()}
@@ -173,21 +175,41 @@ def main(_):
             ds = Dataset.create(**ds_dict)
             abs_dense_rewards = np.abs(dense_rewards)
             nonzero_frac = float((abs_dense_rewards > 1e-9).mean())
+            dense_stats = {
+                "mean": float(dense_rewards.mean()),
+                "std": float(dense_rewards.std()),
+                "min": float(dense_rewards.min()),
+                "max": float(dense_rewards.max()),
+                "p01": float(np.quantile(dense_rewards, 0.01)),
+                "p50": float(np.quantile(dense_rewards, 0.50)),
+                "p99": float(np.quantile(dense_rewards, 0.99)),
+                "nonzero_frac": nonzero_frac,
+                "mean_abs": float(abs_dense_rewards.mean()),
+                "p99_abs": float(np.quantile(abs_dense_rewards, 0.99)),
+            }
             print(
                 "Dense rewards: "
-                f"mean={dense_rewards.mean():.4f}, std={dense_rewards.std():.4f}, "
-                f"min={dense_rewards.min():.4f}, max={dense_rewards.max():.4f}, "
-                f"p01={np.quantile(dense_rewards, 0.01):.4f}, "
-                f"p50={np.quantile(dense_rewards, 0.50):.4f}, "
-                f"p99={np.quantile(dense_rewards, 0.99):.4f}, "
+                f"mean={dense_stats['mean']:.4f}, std={dense_stats['std']:.4f}, "
+                f"min={dense_stats['min']:.4f}, max={dense_stats['max']:.4f}, "
+                f"p01={dense_stats['p01']:.4f}, "
+                f"p50={dense_stats['p50']:.4f}, "
+                f"p99={dense_stats['p99']:.4f}, "
                 f"nonzero_frac={nonzero_frac:.4f}"
             )
             if FLAGS.dense_reward_version in ("v4", "v5", "v6"):
                 print(
                     "Dense reward delta-mode check: "
-                    f"mean_abs={abs_dense_rewards.mean():.6f}, "
-                    f"p99_abs={np.quantile(abs_dense_rewards, 0.99):.6f}"
+                    f"mean_abs={dense_stats['mean_abs']:.6f}, "
+                    f"p99_abs={dense_stats['p99_abs']:.6f}"
                 )
+                print(f"Dense shaping lambda: {FLAGS.dense_shaping_lambda:.4f}")
+            wandb.log(
+                {
+                    **{f"dense_reward/{k}": v for k, v in dense_stats.items()},
+                    "dense_reward/shaping_lambda": FLAGS.dense_shaping_lambda,
+                },
+                step=0,
+            )
 
         return ds
     
@@ -405,6 +427,7 @@ def main(_):
                 curr_ob=next_ob,
                 discount=gamma,
                 terminal_bonus=FLAGS.terminal_bonus,
+                shaping_coef=FLAGS.dense_shaping_lambda,
             )
             prev_qpos_dense = curr_qpos_dense
 

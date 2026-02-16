@@ -5,7 +5,7 @@
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.20
 
-echo "Launching all ONLINE Task 2 dense variants (v1-v5)..."
+echo "Launching all ONLINE Task 2 dense variants (v1-v6)..."
 
 bash scripts/double/online/run_task2_dense_v1.sh &
 sleep 1
@@ -16,6 +16,8 @@ sleep 1
 bash scripts/double/online/run_task2_dense_v4.sh &
 sleep 1
 bash scripts/double/online/run_task2_dense_v5.sh &
+sleep 1
+bash scripts/double/online/run_task2_dense_v6.sh &
 
 echo "All online tasks launched. Waiting for completion..."
 wait

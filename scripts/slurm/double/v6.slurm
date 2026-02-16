@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=qam_double_v6_7
+#SBATCH --job-name=qam_double_v6_8
 #SBATCH --partition=rlwrld
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/slurm/double_v6_7_%j.out
-#SBATCH --error=logs/slurm/double_v6_7_%j.err
+#SBATCH --output=logs/slurm/double_v6_8_%j.out
+#SBATCH --error=logs/slurm/double_v6_8_%j.err
 
 set -euo pipefail
 

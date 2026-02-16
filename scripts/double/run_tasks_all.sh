@@ -22,6 +22,8 @@ sleep 1
 bash scripts/double/run_task2_dense_v4.sh &
 sleep 1
 bash scripts/double/run_task2_dense_v5.sh &
+sleep 1
+bash scripts/double/run_task2_dense_v6.sh &
 
 echo "All tasks launched. Waiting for completion..."
 wait

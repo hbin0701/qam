@@ -523,29 +523,44 @@ class DenseRewardWrapper:
             out[i] = self.compute_potential(qpos_data[i], qvel, gripper_pos=gp) + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
-    def compute_v4_dataset_rewards(self, ds: Dict[str, np.ndarray], discount: float = 0.99, terminal_bonus: float = 1.0) -> np.ndarray:
-        self._require_keys(ds, ['qpos', 'next_qpos'], "v4")
+    def compute_v4_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v4")
         qpos_data = ds['qpos']
         qvel_data = ds.get('qvel', None)
         next_qpos_data = ds['next_qpos']
         next_qvel_data = ds.get('next_qvel', None)
+        base_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
             next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
             curr_progress, _ = self.compute_progress(qpos_data[i], qvel)
             next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel)
-            out[i] = (discount * next_progress - curr_progress) + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+            shaping = shaping_coef * (discount * next_progress - curr_progress)
+            out[i] = base_rewards[i] + shaping + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
-    def compute_v5_dataset_rewards(self, ds: Dict[str, np.ndarray], discount: float = 0.99, terminal_bonus: float = 1.0) -> np.ndarray:
-        self._require_keys(ds, ['qpos', 'next_qpos'], "v5")
+    def compute_v5_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v5")
         qpos_data = ds['qpos']
         qvel_data = ds.get('qvel', None)
         next_qpos_data = ds['next_qpos']
         next_qvel_data = ds.get('next_qvel', None)
         obs_data = ds.get('observations', None)
         next_obs_data = ds.get('next_observations', None)
+        base_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
@@ -554,17 +569,25 @@ class DenseRewardWrapper:
             next_gp = extract_gripper_pos(next_obs_data[i]) if next_obs_data is not None else None
             curr_progress, _ = self.compute_progress(qpos_data[i], qvel, gripper_pos=gp)
             next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
-            out[i] = (discount * next_progress - curr_progress) + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+            shaping = shaping_coef * (discount * next_progress - curr_progress)
+            out[i] = base_rewards[i] + shaping + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
-    def compute_v6_dataset_rewards(self, ds: Dict[str, np.ndarray], discount: float = 0.99, terminal_bonus: float = 1.0) -> np.ndarray:
-        self._require_keys(ds, ['qpos', 'next_qpos'], "v6")
+    def compute_v6_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v6")
         qpos_data = ds['qpos']
         qvel_data = ds.get('qvel', None)
         next_qpos_data = ds['next_qpos']
         next_qvel_data = ds.get('next_qvel', None)
         obs_data = ds.get('observations', None)
         next_obs_data = ds.get('next_observations', None)
+        base_rewards = ds['rewards']
         out = np.zeros(len(qpos_data), dtype=np.float32)
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
@@ -573,7 +596,8 @@ class DenseRewardWrapper:
             next_gp = extract_gripper_pos(next_obs_data[i]) if next_obs_data is not None else None
             curr_progress, _ = self.compute_progress(qpos_data[i], qvel, gripper_pos=gp)
             next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
-            out[i] = (discount * next_progress - curr_progress) + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+            shaping = shaping_coef * (discount * next_progress - curr_progress)
+            out[i] = base_rewards[i] + shaping + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
     def compute_dataset_rewards(
@@ -581,6 +605,7 @@ class DenseRewardWrapper:
         ds: Dict[str, np.ndarray],
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
     ) -> np.ndarray:
         """Compute dense rewards for a transition dataset via version-specific handlers."""
         if self.version == 'v1':
@@ -590,11 +615,11 @@ class DenseRewardWrapper:
         if self.version == 'v3':
             return self.compute_v3_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
         if self.version == 'v4':
-            return self.compute_v4_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+            return self.compute_v4_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
         if self.version == 'v5':
-            return self.compute_v5_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+            return self.compute_v5_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
         if self.version == 'v6':
-            return self.compute_v6_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+            return self.compute_v6_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
         raise ValueError(f"Unknown version for dataset rewards: {self.version}")
 
     def compute_v1_online_reward(
@@ -635,11 +660,13 @@ class DenseRewardWrapper:
         env_reward: float,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
         **_,
     ) -> float:
         prev_progress, _ = self.compute_progress(prev_qpos)
         curr_progress, _ = self.compute_progress(curr_qpos)
-        return float((discount * curr_progress - prev_progress) + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        return float(env_reward + shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
     def compute_v5_online_reward(
         self,
@@ -650,13 +677,15 @@ class DenseRewardWrapper:
         curr_ob: Optional[np.ndarray] = None,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
         **_,
     ) -> float:
         prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
         curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
         prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
         curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
-        return float((discount * curr_progress - prev_progress) + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        return float(env_reward + shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
     def compute_v6_online_reward(
         self,
@@ -667,13 +696,15 @@ class DenseRewardWrapper:
         curr_ob: Optional[np.ndarray] = None,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
         **_,
     ) -> float:
         prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
         curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
         prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
         curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
-        return float((discount * curr_progress - prev_progress) + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        return float(env_reward + shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
     def compute_online_reward(
         self,
@@ -684,6 +715,7 @@ class DenseRewardWrapper:
         curr_ob: Optional[np.ndarray] = None,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
     ) -> float:
         """Compute dense reward for an online transition via version-specific handlers."""
         if self.version == 'v1':
@@ -717,6 +749,7 @@ class DenseRewardWrapper:
                 env_reward=env_reward,
                 discount=discount,
                 terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
             )
         if self.version == 'v5':
             return self.compute_v5_online_reward(
@@ -727,6 +760,7 @@ class DenseRewardWrapper:
                 curr_ob=curr_ob,
                 discount=discount,
                 terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
             )
         if self.version == 'v6':
             return self.compute_v6_online_reward(
@@ -737,5 +771,6 @@ class DenseRewardWrapper:
                 curr_ob=curr_ob,
                 discount=discount,
                 terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
             )
         raise ValueError(f"Unknown version for online rewards: {self.version}")

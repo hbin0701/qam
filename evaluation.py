@@ -4,6 +4,9 @@ import jax
 import numpy as np
 from tqdm import trange
 from functools import partial
+from contextlib import contextmanager
+import fcntl
+import os
 
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
@@ -33,6 +36,30 @@ def add_to(dict_of_lists, single_dict):
     """Append values to the corresponding lists in the dictionary."""
     for k, v in single_dict.items():
         dict_of_lists[k].append(v)
+
+
+@contextmanager
+def _render_lock_if_needed():
+    """Serialize EGL rendering on the same GPU across processes.
+
+    MuJoCo EGL offscreen context creation can fail when many jobs render concurrently on one GPU.
+    We use a cooperative file lock keyed by MUJOCO_EGL_DEVICE_ID.
+    """
+    use_lock = os.environ.get("MUJOCO_GL", "").lower() == "egl"
+    if not use_lock:
+        yield
+        return
+
+    gpu_id = os.environ.get("MUJOCO_EGL_DEVICE_ID", "0")
+    lock_path = f"/tmp/mujoco_egl_render_gpu_{gpu_id}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
 
 def evaluate(
     agent,
@@ -64,6 +91,7 @@ def evaluate(
     actor_fn = supply_rng(partial(agent.sample_actions, **extra_sample_kwargs), rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
+    render_disabled = False
 
     renders = []
     for i in trange(num_eval_episodes + num_video_episodes):
@@ -105,9 +133,15 @@ def evaluate(
             done = terminated or truncated
             step += 1
 
-            if should_render and (step % video_frame_skip == 0 or done):
-                frame = env.render().copy()
-                render.append(frame)
+            if should_render and (step % video_frame_skip == 0 or done) and not render_disabled:
+                try:
+                    with _render_lock_if_needed():
+                        frame = env.render().copy()
+                    render.append(frame)
+                except Exception as e:
+                    # Keep training/eval alive when EGL offscreen rendering is unavailable.
+                    render_disabled = True
+                    print(f"[WARN] Disabling eval video rendering after render failure: {e}", flush=True)
 
             transition = dict(
                 observation=observation,
@@ -157,4 +191,3 @@ def evaluate(
         stats[k] = np.mean(v)
 
     return stats, trajs, renders
-
