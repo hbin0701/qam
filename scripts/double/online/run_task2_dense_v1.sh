@@ -10,7 +10,7 @@ export MUJOCO_EGL_DEVICE_ID=0
 
 MUJOCO_GL=egl python main.py \
     --run_group=double_task2_rewards_online \
-    --project=project-qam-v5 \
+    --project=0217-qam-online \
     --run_name=DOUBLE_QAM_EDIT_ONLINE_V1.8_Seed10001 \
     --agent=agents/qam.py \
     --tags=QAM_EDIT,dense_v1,online \

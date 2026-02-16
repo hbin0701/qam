@@ -51,9 +51,9 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
-flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6), None for original rewards')
-flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v6).')
-flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v7).')
+flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
 
 def save_csv_loggers(csv_loggers, save_dir):
     for prefix, csv_logger in csv_loggers.items():
@@ -196,7 +196,7 @@ def main(_):
                 f"p99={dense_stats['p99']:.4f}, "
                 f"nonzero_frac={nonzero_frac:.4f}"
             )
-            if FLAGS.dense_reward_version in ("v4", "v5", "v6"):
+            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7"):
                 print(
                     "Dense reward delta-mode check: "
                     f"mean_abs={dense_stats['mean_abs']:.6f}, "

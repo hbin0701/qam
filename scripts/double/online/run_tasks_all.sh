@@ -18,6 +18,7 @@ sleep 1
 bash scripts/double/online/run_task2_dense_v5.sh &
 sleep 1
 bash scripts/double/online/run_task2_dense_v6.sh &
+bash scripts/double/online/run_task2_dense_v7.sh &
 
 echo "All online tasks launched. Waiting for completion..."
 wait
