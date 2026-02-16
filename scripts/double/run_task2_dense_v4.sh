@@ -1,13 +1,13 @@
 #!/bin/bash
 # Run QAM-EDIT on Double-Play Task 2 with DENSE V4 reward (potential-based v2) on GPU 1
 
-export CUDA_VISIBLE_DEVICES=1
-export MUJOCO_EGL_DEVICE_ID=1
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-1}"
 
 MUJOCO_GL=egl python main.py \
     --run_group=double_task2_rewards \
-    --project=qam-reproduce-final \
-    --run_name=qam_edit_v4.2_seed10001 \
+    --project=project-v4 \
+    --run_name=DOUBLE_QAM_EDIT_V4.7_Seed10001 \
     --agent=agents/qam.py \
     --tags=QAM_EDIT,dense_v4 \
     --seed=10001 \
@@ -15,6 +15,7 @@ MUJOCO_GL=egl python main.py \
     --ogbench_dataset_dir=/rlwrld3/home/hyeonbin/.ogbench/data/cube-double-play-1m \
     --sparse=False \
     --dense_reward_version=v4 \
+    --terminal_bonus=50 \
     --horizon_length=5 \
     --agent.action_chunking=True \
     --agent.inv_temp=1.0 \

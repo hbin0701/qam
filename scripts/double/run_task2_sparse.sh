@@ -5,13 +5,13 @@
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.20
 
-export CUDA_VISIBLE_DEVICES=0
-export MUJOCO_EGL_DEVICE_ID=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
 
 MUJOCO_GL=egl python main.py \
     --run_group=double_task2_rewards \
-    --project=qam-reproduce-final \
-    --run_name=qam_edit_sparse_seed10001 \
+    --project=project-v4 \
+    --run_name=DOUBLE_QAM_EDIT_SPARSE_Seed10001 \
     --agent=agents/qam.py \
     --tags=QAM_EDIT,sparse \
     --seed=10001 \
