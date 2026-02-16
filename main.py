@@ -315,7 +315,7 @@ def main(_):
         if i == FLAGS.offline_steps or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
             # during eval, the action chunk is executed fully
-            eval_info, _, renders = evaluate(
+            eval_info, _, renders, render_data = evaluate(
                 agent=agent,
                 env=eval_env,
                 action_dim=example_batch["actions"].shape[-1],
@@ -325,9 +325,17 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video
+                from log_utils import get_wandb_video, get_wandb_video_with_reward
                 video = get_wandb_video(renders)
-                logger.wandb_logger.log({'eval/video': video}, step=log_step)
+                video_reward = get_wandb_video_with_reward(
+                    renders,
+                    render_data.get("reward_traces", []),
+                    render_data.get("frame_steps", []),
+                )
+                payload = {'eval/video': video}
+                if video_reward is not None:
+                    payload['eval/video_reward'] = video_reward
+                logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
             
@@ -480,7 +488,7 @@ def main(_):
 
         if i == FLAGS.online_steps or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
-            eval_info, _, renders = evaluate(
+            eval_info, _, renders, render_data = evaluate(
                 agent=agent,
                 env=eval_env,
                 action_dim=action_dim,
@@ -490,9 +498,17 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video
+                from log_utils import get_wandb_video, get_wandb_video_with_reward
                 video = get_wandb_video(renders)
-                logger.wandb_logger.log({'eval/video': video}, step=log_step)
+                video_reward = get_wandb_video_with_reward(
+                    renders,
+                    render_data.get("reward_traces", []),
+                    render_data.get("frame_steps", []),
+                )
+                payload = {'eval/video': video}
+                if video_reward is not None:
+                    payload['eval/video_reward'] = video_reward
+                logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
 

@@ -186,3 +186,88 @@ def get_wandb_video(renders=None, n_cols=None, fps=15):
     renders = reshape_video(renders, n_cols)  # (t, c, nr * h, nc * w)
 
     return wandb.Video(renders, fps=fps, format='mp4')
+
+
+def _draw_line(img, x0, y0, x1, y1, color):
+    """Draw a line segment on an HWC uint8 image with simple interpolation."""
+    h, w = img.shape[:2]
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    if n <= 0:
+        return
+    xs = np.linspace(x0, x1, n).astype(np.int32)
+    ys = np.linspace(y0, y1, n).astype(np.int32)
+    valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+    img[ys[valid], xs[valid]] = color
+
+
+def _make_reward_plot_frame(rewards, cursor_step, height, width):
+    """Create a reward-vs-time plot image with a moving cursor line."""
+    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    if rewards is None or len(rewards) == 0:
+        return canvas
+
+    # Plot margins.
+    left, right = 32, 10
+    top, bottom = 10, 24
+    plot_w = max(1, width - left - right)
+    plot_h = max(1, height - top - bottom)
+
+    # Axes.
+    axis_color = np.array([80, 80, 80], dtype=np.uint8)
+    _draw_line(canvas, left, top, left, top + plot_h, axis_color)
+    _draw_line(canvas, left, top + plot_h, left + plot_w, top + plot_h, axis_color)
+
+    r = np.asarray(rewards, dtype=np.float32)
+    n = len(r)
+    if n == 1:
+        r_min, r_max = float(r[0] - 1.0), float(r[0] + 1.0)
+    else:
+        r_min, r_max = float(np.min(r)), float(np.max(r))
+        if abs(r_max - r_min) < 1e-8:
+            r_min -= 1.0
+            r_max += 1.0
+
+    # Reward curve.
+    curve_color = np.array([52, 120, 246], dtype=np.uint8)
+    xs = left + np.round(np.arange(n) * (plot_w / max(1, n - 1))).astype(np.int32)
+    ys = top + np.round((1.0 - (r - r_min) / (r_max - r_min)) * plot_h).astype(np.int32)
+    ys = np.clip(ys, top, top + plot_h)
+    for i in range(1, n):
+        _draw_line(canvas, xs[i - 1], ys[i - 1], xs[i], ys[i], curve_color)
+
+    # Moving cursor.
+    cursor_step = int(np.clip(cursor_step, 0, n - 1))
+    cx = left + int(round(cursor_step * (plot_w / max(1, n - 1))))
+    cursor_color = np.array([230, 30, 30], dtype=np.uint8)
+    _draw_line(canvas, cx, top, cx, top + plot_h, cursor_color)
+
+    return canvas
+
+
+def get_wandb_video_with_reward(renders, reward_traces, frame_steps, n_cols=None, fps=15):
+    """Return a W&B video with environment frames + synchronized reward-time plot.
+
+    Args:
+        renders: list of (t_i, h, w, c) uint8 arrays.
+        reward_traces: list of (T_i,) reward arrays per episode.
+        frame_steps: list of (t_i,) indices mapping each rendered frame to env step.
+    """
+    if renders is None or len(renders) == 0:
+        return None
+
+    composite_renders = []
+    for i, render in enumerate(renders):
+        if len(render) == 0:
+            continue
+        rewards = reward_traces[i] if i < len(reward_traces) else np.zeros((1,), dtype=np.float32)
+        steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
+        episode_frames = []
+        for j, frame in enumerate(render):
+            step_idx = steps[j] if j < len(steps) else (len(rewards) - 1)
+            plot = _make_reward_plot_frame(rewards, step_idx, frame.shape[0], frame.shape[1])
+            episode_frames.append(np.concatenate([frame, plot], axis=1))
+        composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
+
+    if len(composite_renders) == 0:
+        return None
+    return get_wandb_video(composite_renders, n_cols=n_cols, fps=fps)

@@ -86,7 +86,11 @@ def evaluate(
         eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
 
     Returns:
-        A tuple containing the statistics, trajectories, and rendered videos.
+        A tuple containing:
+          - statistics dict
+          - trajectories
+          - rendered videos
+          - render metadata dict with reward traces and rendered frame step indices
     """
     actor_fn = supply_rng(partial(agent.sample_actions, **extra_sample_kwargs), rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
@@ -94,6 +98,8 @@ def evaluate(
     render_disabled = False
 
     renders = []
+    render_reward_traces = []
+    render_frame_steps = []
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
@@ -106,6 +112,8 @@ def evaluate(
         done = False
         step = 0
         render = []
+        render_steps = []
+        reward_trace = []
         action_chunk_lens = defaultdict(lambda: 0)
 
         action_queue = []
@@ -132,12 +140,14 @@ def evaluate(
             next_observation, reward, terminated, truncated, info = env.step(np.clip(action, -1, 1))
             done = terminated or truncated
             step += 1
+            reward_trace.append(float(reward))
 
             if should_render and (step % video_frame_skip == 0 or done) and not render_disabled:
                 try:
                     with _render_lock_if_needed():
                         frame = env.render().copy()
                     render.append(frame)
+                    render_steps.append(step - 1)
                 except Exception as e:
                     # Keep training/eval alive when EGL offscreen rendering is unavailable.
                     render_disabled = True
@@ -186,8 +196,14 @@ def evaluate(
             trajs.append(traj)
         else:
             renders.append(np.array(render))
+            render_reward_traces.append(np.array(reward_trace, dtype=np.float32))
+            render_frame_steps.append(np.array(render_steps, dtype=np.int32))
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
-    return stats, trajs, renders
+    render_data = {
+        "reward_traces": render_reward_traces,
+        "frame_steps": render_frame_steps,
+    }
+    return stats, trajs, renders, render_data
