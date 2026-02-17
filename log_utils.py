@@ -296,6 +296,92 @@ def _make_reward_plot_frame(rewards, cursor_step, height, width):
     return np.asarray(img, dtype=np.uint8)
 
 
+def _make_metric_plot_frame(values, cursor_step, height, width, title):
+    """Create a generic metric-vs-time plot image with a moving cursor line."""
+    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
+    if values is None or len(values) == 0:
+        return canvas
+
+    left, right = 44, 14
+    top, bottom = 16, 30
+    plot_w = max(1, width - left - right)
+    plot_h = max(1, height - top - bottom)
+
+    canvas[top : top + plot_h + 1, left : left + plot_w + 1] = np.array([252, 252, 253], dtype=np.uint8)
+
+    axis_color = np.array([92, 102, 112], dtype=np.uint8)
+    _draw_line(canvas, left, top, left, top + plot_h, axis_color)
+    _draw_line(canvas, left, top + plot_h, left + plot_w, top + plot_h, axis_color)
+
+    r_raw = np.asarray(values, dtype=np.float32)
+    if r_raw.size == 0:
+        return canvas
+    finite = np.isfinite(r_raw)
+    if not np.any(finite):
+        r = np.zeros_like(r_raw)
+    else:
+        fallback = float(np.nanmean(r_raw[finite]))
+        r = np.where(finite, r_raw, fallback)
+    n = len(r)
+
+    if n == 1:
+        r_min, r_max = float(r[0] - 1.0), float(r[0] + 1.0)
+    else:
+        r_min, r_max = float(np.min(r)), float(np.max(r))
+        if abs(r_max - r_min) < 1e-8:
+            r_min -= 1.0
+            r_max += 1.0
+
+    tick_color = np.array([170, 180, 190], dtype=np.uint8)
+    y_ticks = np.linspace(r_min, r_max, 5)
+    x_ticks = [0, max(0, n // 2), max(0, n - 1)]
+    for yv in y_ticks:
+        y = top + int(round((1.0 - (yv - r_min) / (r_max - r_min)) * plot_h))
+        _draw_line(canvas, left, y, left + plot_w, y, tick_color)
+    for xv in x_ticks:
+        x = left + int(round(xv * (plot_w / max(1, n - 1))))
+        _draw_line(canvas, x, top, x, top + plot_h, tick_color)
+
+    curve_color = np.array([34, 119, 217], dtype=np.uint8)
+    xs = left + np.round(np.arange(n) * (plot_w / max(1, n - 1))).astype(np.int32)
+    ys = top + np.round((1.0 - (r - r_min) / (r_max - r_min)) * plot_h).astype(np.int32)
+    ys = np.clip(ys, top, top + plot_h)
+    for i in range(1, n):
+        _draw_line(canvas, xs[i - 1], ys[i - 1] + 1, xs[i], ys[i] + 1, curve_color)
+        _draw_line(canvas, xs[i - 1], ys[i - 1], xs[i], ys[i], curve_color)
+
+    cursor_step = int(np.clip(cursor_step, 0, n - 1))
+    cx = left + int(round(cursor_step * (plot_w / max(1, n - 1))))
+    cursor_color = np.array([234, 67, 53], dtype=np.uint8)
+    _draw_line(canvas, cx, top, cx, top + plot_h, cursor_color)
+
+    cy = top + int(round((1.0 - (r[cursor_step] - r_min) / (r_max - r_min)) * plot_h))
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            yy, xx = cy + dy, cx + dx
+            if 0 <= yy < height and 0 <= xx < width:
+                canvas[yy, xx] = cursor_color
+
+    img = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+    text_color = (65, 75, 85)
+
+    for yv in y_ticks:
+        y = top + int(round((1.0 - (yv - r_min) / (r_max - r_min)) * plot_h))
+        draw.text((4, y - 5), _format_tick(yv), fill=text_color, font=font)
+
+    for xv in x_ticks:
+        x = left + int(round(xv * (plot_w / max(1, n - 1))))
+        draw.text((x - 8, top + plot_h + 6), str(int(xv)), fill=text_color, font=font)
+
+    draw.text((left, 2), title, fill=text_color, font=font)
+    draw.text((left + plot_w - 74, 2), f"step {cursor_step}", fill=(90, 98, 108), font=font)
+    draw.text((left + plot_w - 74, 12), f"v {r[cursor_step]:.3f}", fill=(90, 98, 108), font=font)
+
+    return np.asarray(img, dtype=np.uint8)
+
+
 def get_wandb_video_with_reward(renders, reward_traces, frame_steps, n_cols=None, fps=15):
     """Return a W&B video with environment frames + synchronized reward-time plot.
 
@@ -318,6 +404,41 @@ def get_wandb_video_with_reward(renders, reward_traces, frame_steps, n_cols=None
             step_idx = steps[j] if j < len(steps) else (len(rewards) - 1)
             plot = _make_reward_plot_frame(rewards, step_idx, frame.shape[0], frame.shape[1])
             episode_frames.append(np.concatenate([frame, plot], axis=1))
+        composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
+
+    if len(composite_renders) == 0:
+        return None
+    return get_wandb_video(composite_renders, n_cols=n_cols, fps=fps)
+
+
+def get_wandb_video_with_progress(
+    renders,
+    progress_traces,
+    potential_diff_traces,
+    frame_steps,
+    n_cols=None,
+    fps=15,
+):
+    """Return a W&B video with frames + two synchronized plots (progress, potential diff)."""
+    if renders is None or len(renders) == 0:
+        return None
+
+    composite_renders = []
+    for i, render in enumerate(renders):
+        if len(render) == 0:
+            continue
+        progresses = progress_traces[i] if i < len(progress_traces) else np.zeros((1,), dtype=np.float32)
+        pot_diffs = potential_diff_traces[i] if i < len(potential_diff_traces) else np.zeros((1,), dtype=np.float32)
+        steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
+        episode_frames = []
+        for j, frame in enumerate(render):
+            step_idx = steps[j] if j < len(steps) else (len(progresses) - 1)
+            top_h = frame.shape[0] // 2
+            bottom_h = frame.shape[0] - top_h
+            progress_plot = _make_metric_plot_frame(progresses, step_idx, top_h, frame.shape[1], "progress")
+            pot_diff_plot = _make_metric_plot_frame(pot_diffs, step_idx, bottom_h, frame.shape[1], "potential_diff")
+            panel = np.concatenate([progress_plot, pot_diff_plot], axis=0)
+            episode_frames.append(np.concatenate([frame, panel], axis=1))
         composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
 
     if len(composite_renders) == 0:

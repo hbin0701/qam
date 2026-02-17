@@ -5,7 +5,7 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
-from envs.rewards.cube_dense_reward import DenseRewardWrapper
+from envs.rewards.cube_dense_reward import DenseRewardWrapper, extract_gripper_pos
 
 from utils.flax_utils import save_agent, restore_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -51,13 +51,23 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
-flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7), None for original rewards')
-flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v7).')
-flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v8).')
+flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
 flags.DEFINE_bool(
     'randomize_task_init_cube_pos',
     False,
     'If True, randomize initial cube XY at reset for task-mode OGBench cube envs (single-cube only).',
+)
+flags.DEFINE_float(
+    'cube_success_threshold',
+    0.04,
+    'Cube success threshold for env success checks and dense reward potential/success.',
+)
+flags.DEFINE_integer(
+    'max_episode_steps',
+    0,
+    'Override env max episode steps when > 0. 0 keeps the registered default.',
 )
 
 def save_csv_loggers(csv_loggers, save_dir):
@@ -112,18 +122,29 @@ def main(_):
             print("actual data proportion:", num_subset_datasets / num_datasets)
             dataset_paths = dataset_paths[:num_subset_datasets]
 
+        env_kwargs = dict(
+            randomize_task_init=FLAGS.randomize_task_init_cube_pos,
+            cube_success_threshold=FLAGS.cube_success_threshold,
+        )
+        if FLAGS.max_episode_steps > 0:
+            env_kwargs['max_episode_steps'] = FLAGS.max_episode_steps
+
         env, eval_env, train_dataset, val_dataset = make_ogbench_env_and_datasets(
             FLAGS.env_name,
             dataset_path=dataset_paths[dataset_idx],
             compact_dataset=False,
             add_info=(FLAGS.dense_reward_version is not None),  # Load qpos/qvel for dense rewards
-            randomize_task_init=FLAGS.randomize_task_init_cube_pos,
+            **env_kwargs,
         )
     else:
-        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(
-            FLAGS.env_name,
+        env_kwargs = dict(
             randomize_task_init=FLAGS.randomize_task_init_cube_pos,
+            cube_success_threshold=FLAGS.cube_success_threshold,
         )
+        if FLAGS.max_episode_steps > 0:
+            env_kwargs['max_episode_steps'] = FLAGS.max_episode_steps
+
+        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, **env_kwargs)
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -142,7 +163,8 @@ def main(_):
         dense_wrapper = DenseRewardWrapper(
             task_name=FLAGS.env_name,
             version=FLAGS.dense_reward_version,
-            debug=False
+            debug=False,
+            success_threshold=FLAGS.cube_success_threshold,
         )
 
     # handle dataset
@@ -205,7 +227,7 @@ def main(_):
                 f"p99={dense_stats['p99']:.4f}, "
                 f"nonzero_frac={nonzero_frac:.4f}"
             )
-            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7"):
+            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8"):
                 print(
                     "Dense reward delta-mode check: "
                     f"mean_abs={dense_stats['mean_abs']:.6f}, "
@@ -336,10 +358,11 @@ def main(_):
                 dense_discount=FLAGS.agent.discount,
                 dense_terminal_bonus=FLAGS.terminal_bonus,
                 dense_shaping_lambda=FLAGS.dense_shaping_lambda,
+                eval_seed=FLAGS.seed,
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video, get_wandb_video_with_reward
+                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress
                 video = get_wandb_video(renders)
                 video_reward = get_wandb_video_with_reward(
                     renders,
@@ -349,6 +372,15 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8"):
+                    video_progress = get_wandb_video_with_progress(
+                        renders,
+                        render_data.get("progress_traces", []),
+                        render_data.get("potential_diff_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if video_progress is not None:
+                        payload['eval/video_progress'] = video_progress
                 logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
@@ -381,10 +413,26 @@ def main(_):
     # Online RL
     update_info = {}
     action_queue = [] # for action chunking
-    ob, _ = env.reset()
+    online_reset_seed_base = int(FLAGS.seed) + 1000000
+    online_episode_idx = 0
+    try:
+        ob, _ = env.reset(seed=online_reset_seed_base + online_episode_idx)
+    except TypeError:
+        ob, _ = env.reset()
+    online_episode_idx += 1
 
     # Previous state for wrapper-based dense online rewards.
     prev_qpos_dense = env.unwrapped._data.qpos.copy() if dense_wrapper is not None else None
+    if dense_wrapper is not None:
+        dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
+    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version == "v8"
+    chunk_start_qpos_dense = None
+    chunk_start_ob_dense = None
+    chunk_step_count_dense = 0
+    online_success_steps = 0
+    online_episode_successes = 0
+    online_episode_count = 0
+    current_episode_had_success = False
     gamma = FLAGS.agent.discount
 
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
@@ -423,6 +471,10 @@ def main(_):
             action_chunk = np.array(action).reshape(-1, action_dim)
             for action in action_chunk:
                 action_queue.append(action)
+            if v8_chunk_shaping and prev_qpos_dense is not None:
+                chunk_start_qpos_dense = prev_qpos_dense.copy()
+                chunk_start_ob_dense = np.array(ob, copy=True)
+                chunk_step_count_dense = 0
         action = action_queue.pop(0)
         
         next_ob, int_reward, terminated, truncated, info = env.step(action)
@@ -433,6 +485,21 @@ def main(_):
         for key, value in info.items():
             if key.startswith("distance"): # for cubes
                 env_info[key] = value
+        step_success = float(bool(info.get("success", False)))
+        if step_success > 0:
+            current_episode_had_success = True
+            online_success_steps += 1
+        env_info["success_step"] = step_success
+        env_info["success_steps_cum"] = float(online_success_steps)
+        env_info["success_step_rate"] = float(online_success_steps / i)
+        if done:
+            online_episode_count += 1
+            if current_episode_had_success:
+                online_episode_successes += 1
+            current_episode_had_success = False
+        env_info["episode_success_rate"] = float(
+            online_episode_successes / max(online_episode_count, 1)
+        )
         # always log this at every step
         logger.log(env_info, "env", step=log_step)
 
@@ -441,16 +508,44 @@ def main(_):
             int_reward = (int_reward != 0.0) * -1.0
         elif dense_wrapper is not None:
             curr_qpos_dense = env.unwrapped._data.qpos.copy()
-            int_reward = dense_wrapper.compute_online_reward(
-                prev_qpos=prev_qpos_dense,
-                curr_qpos=curr_qpos_dense,
-                env_reward=float(int_reward),
-                prev_ob=ob,
-                curr_ob=next_ob,
-                discount=gamma,
-                terminal_bonus=FLAGS.terminal_bonus,
-                shaping_coef=FLAGS.dense_shaping_lambda,
-            )
+            if v8_chunk_shaping:
+                base_plus_events = dense_wrapper.compute_online_reward(
+                    prev_qpos=prev_qpos_dense,
+                    curr_qpos=curr_qpos_dense,
+                    env_reward=float(int_reward),
+                    prev_ob=ob,
+                    curr_ob=next_ob,
+                    discount=gamma,
+                    terminal_bonus=FLAGS.terminal_bonus,
+                    shaping_coef=0.0,
+                )
+                chunk_step_count_dense += 1
+                is_chunk_end = (len(action_queue) == 0) or done
+                chunk_shaping = 0.0
+                if is_chunk_end and chunk_start_qpos_dense is not None and chunk_start_ob_dense is not None:
+                    prev_gp = extract_gripper_pos(chunk_start_ob_dense)
+                    curr_gp = extract_gripper_pos(next_ob)
+                    prev_progress, _ = dense_wrapper.compute_progress(chunk_start_qpos_dense, gripper_pos=prev_gp)
+                    curr_progress, _ = dense_wrapper.compute_progress(curr_qpos_dense, gripper_pos=curr_gp)
+                    chunk_shaping = FLAGS.dense_shaping_lambda * (
+                        (gamma ** chunk_step_count_dense) * curr_progress - prev_progress
+                    )
+                int_reward = float(base_plus_events + chunk_shaping)
+                if is_chunk_end:
+                    chunk_start_qpos_dense = None
+                    chunk_start_ob_dense = None
+                    chunk_step_count_dense = 0
+            else:
+                int_reward = dense_wrapper.compute_online_reward(
+                    prev_qpos=prev_qpos_dense,
+                    curr_qpos=curr_qpos_dense,
+                    env_reward=float(int_reward),
+                    prev_ob=ob,
+                    curr_ob=next_ob,
+                    discount=gamma,
+                    terminal_bonus=FLAGS.terminal_bonus,
+                    shaping_coef=FLAGS.dense_shaping_lambda,
+                )
             prev_qpos_dense = curr_qpos_dense
 
         transition = dict(
@@ -465,10 +560,18 @@ def main(_):
         
         # done
         if done:
-            ob, _ = env.reset()
+            try:
+                ob, _ = env.reset(seed=online_reset_seed_base + online_episode_idx)
+            except TypeError:
+                ob, _ = env.reset()
+            online_episode_idx += 1
             action_queue = []  # reset the action queue
             if dense_wrapper is not None:
                 prev_qpos_dense = env.unwrapped._data.qpos.copy()
+                dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
+                chunk_start_qpos_dense = None
+                chunk_start_ob_dense = None
+                chunk_step_count_dense = 0
         else:
             ob = next_ob
 
@@ -514,10 +617,11 @@ def main(_):
                 dense_discount=FLAGS.agent.discount,
                 dense_terminal_bonus=FLAGS.terminal_bonus,
                 dense_shaping_lambda=FLAGS.dense_shaping_lambda,
+                eval_seed=FLAGS.seed,
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video, get_wandb_video_with_reward
+                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress
                 video = get_wandb_video(renders)
                 video_reward = get_wandb_video_with_reward(
                     renders,
@@ -527,6 +631,15 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8"):
+                    video_progress = get_wandb_video_with_progress(
+                        renders,
+                        render_data.get("progress_traces", []),
+                        render_data.get("potential_diff_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if video_progress is not None:
+                        payload['eval/video_progress'] = video_progress
                 logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")

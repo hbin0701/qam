@@ -13,6 +13,7 @@ Reward versions:
 - v6: Pick-place style progress-delta (4 subtasks per cube) + terminal bonus
 - v7: Pick-place style progress-delta (3 subtasks, no release stage)
       + placement event bonus/penalty + terminal bonus
+- v8: v7 + explicit release event bonus/penalty
 """
 
 import re
@@ -40,6 +41,8 @@ V6_GRIPPER_CLOSED_THRESHOLD = 0.50
 V6_GRIPPER_CLOSED_REF = 0.56
 V6_GRASP_LIFT_THRESHOLD = 0.008
 V6_GRASP_LIFT_TARGET = 0.02
+V8_RELEASE_SUCCESS_BONUS = 0.5
+V8_RELEASE_FAR_PENALTY = 0.25
 
 
 def compute_cube_order(init_positions: np.ndarray, reference: np.ndarray = GRIPPER_HOME) -> List[int]:
@@ -147,19 +150,24 @@ def parse_env_name(env_name: str) -> Tuple[str, int, int]:
 # ============================================================
 class CubeState:
     """State for a single cube."""
-    def __init__(self, position=None, goal_position=None):
+    def __init__(self, position=None, goal_position=None, success_threshold=CUBE_SUCCESS_THRESHOLD):
         self.position: np.ndarray = np.array(position) if position is not None else np.zeros(3)
         self.initial_position: np.ndarray = self.position.copy()
         self.goal_position: np.ndarray = np.array(goal_position) if goal_position is not None else self.position.copy()
+        self.success_threshold: float = success_threshold
 
     def distance_to_goal(self) -> float:
         return float(np.linalg.norm(self.position - self.goal_position))
 
-    def is_at_goal(self, threshold=CUBE_SUCCESS_THRESHOLD) -> bool:
+    def is_at_goal(self, threshold=None) -> bool:
+        if threshold is None:
+            threshold = self.success_threshold
         return self.distance_to_goal() <= threshold
 
-    def progress_to_goal(self, threshold=CUBE_SUCCESS_THRESHOLD) -> float:
+    def progress_to_goal(self, threshold=None) -> float:
         """Progress from initial position to goal (0.0 to 1.0), saturating at success threshold."""
+        if threshold is None:
+            threshold = self.success_threshold
         initial_dist = np.linalg.norm(self.initial_position - self.goal_position)
         current_dist = self.distance_to_goal()
         if initial_dist < 1e-6:
@@ -175,11 +183,13 @@ class CubeEnvModel:
     """Lightweight physics-free environment model for reward computation."""
     def __init__(self, num_cubes: int, goal_positions: np.ndarray,
                  init_positions: Optional[np.ndarray] = None,
-                 cube_order: Optional[List[int]] = None):
+                 cube_order: Optional[List[int]] = None,
+                 success_threshold: float = CUBE_SUCCESS_THRESHOLD):
         self.num_cubes = num_cubes
         self.goal_positions = goal_positions
+        self.success_threshold = success_threshold
         self.cubes: List[CubeState] = [
-            CubeState(goal_position=goal_positions[i]) for i in range(num_cubes)
+            CubeState(goal_position=goal_positions[i], success_threshold=success_threshold) for i in range(num_cubes)
         ]
         # Set task initial positions for V2 distance-based progress
         if init_positions is not None:
@@ -300,8 +310,8 @@ def progress_v3(env: CubeEnvModel) -> Tuple[float, int]:
             subprogress = 0.5 * reach_progress
     else:
         # Place: progress moving cube from its initial location to goal.
-        effective_current = max(current_dist - CUBE_SUCCESS_THRESHOLD, 0.0)
-        effective_init = max(place_init_dist - CUBE_SUCCESS_THRESHOLD, 1e-6)
+        effective_current = max(current_dist - env.success_threshold, 0.0)
+        effective_init = max(place_init_dist - env.success_threshold, 1e-6)
         place_progress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
         subprogress = 0.5 + 0.5 * place_progress
 
@@ -429,8 +439,9 @@ def progress_v7(env: CubeEnvModel) -> Tuple[float, int]:
         subprogress = 0.6 * lift_progress + 0.4 * close_progress
     else:
         init_goal_dist = float(np.linalg.norm(cube.initial_position - cube.goal_position))
-        init_goal_dist = max(init_goal_dist, 1e-6)
-        subprogress = float(np.clip(1.0 - (cube_goal_dist / init_goal_dist), 0.0, 1.0))
+        effective_current = max(cube_goal_dist - env.success_threshold, 0.0)
+        effective_init = max(init_goal_dist - env.success_threshold, 1e-6)
+        subprogress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
 
     main_progress = float(order_pos) + (float(subtask_idx) + float(np.clip(subprogress, 0.0, 1.0))) / 3.0
     stage = order_pos * 3 + subtask_idx
@@ -447,7 +458,8 @@ PROGRESS_FNS = {
     'v4': progress_v4,  # Potential-based version of v2
     'v5': progress_v3,  # Potential-based version of v3
     'v6': progress_v6,  # Pick-place style delta shaping
-    'v7': progress_v7,  # Pick-place without release + placement events
+    'v7': progress_v7,  # Pick-place without release stage
+    'v8': progress_v7,  # v7 progress + explicit release event shaping
 }
 
 
@@ -469,10 +481,12 @@ class DenseRewardWrapper:
         task_name: str,
         version: str = "v2",
         debug: bool = False,
+        success_threshold: float = CUBE_SUCCESS_THRESHOLD,
     ):
         self.task_name = task_name
         self.version = version
         self.debug = debug
+        self.success_threshold = success_threshold
 
         # Auto-detect from env_name
         self.env_type, self.task_id, self.num_cubes = parse_env_name(task_name)
@@ -485,6 +499,9 @@ class DenseRewardWrapper:
             )
         self.goal_positions = TASK_GOALS[key]
         self.init_positions = TASK_INITS.get(key)
+        # Per-episode init positions (set from actual reset state for online/eval).
+        # When set, these override static TASK_INITS.
+        self.episode_init_positions: Optional[np.ndarray] = None
 
         # Precompute cube ordering for v3/v5/v6: nearest cube to gripper home goes first
         if self.init_positions is not None:
@@ -492,8 +509,8 @@ class DenseRewardWrapper:
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -504,7 +521,7 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5', 'v6', 'v7'):
+        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
@@ -516,13 +533,58 @@ class DenseRewardWrapper:
         - other versions keep centered form, range [-num_cubes, 0].
         """
         progress, _ = self.compute_progress(qpos, qvel, gripper_pos)
-        if self.version in ('v2', 'v3', 'v6', 'v7'):
+        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
 
     def _make_env(self) -> CubeEnvModel:
-        return CubeEnvModel(self.num_cubes, self.goal_positions, self.init_positions, self.cube_order)
+        init_positions = self.episode_init_positions if self.episode_init_positions is not None else self.init_positions
+        return CubeEnvModel(
+            self.num_cubes,
+            self.goal_positions,
+            init_positions,
+            self.cube_order,
+            success_threshold=self.success_threshold,
+        )
+
+    def set_episode_initial_positions_from_qpos(self, qpos: np.ndarray) -> None:
+        """Capture cube initial positions from the actual episode reset state."""
+        init_positions = []
+        for i in range(self.num_cubes):
+            pos_start = 14 + i * 7
+            init_positions.append(qpos[pos_start:pos_start + 3].copy())
+        self.episode_init_positions = np.array(init_positions, dtype=np.float64)
+
+    @staticmethod
+    def _active_cube_idx(env: CubeEnvModel) -> Optional[int]:
+        for idx in env.cube_order:
+            if not env.cubes[idx].is_at_goal():
+                return idx
+        return None
+
+    def _v8_release_event(self, prev_qpos: np.ndarray, curr_qpos: np.ndarray, prev_ob=None, curr_ob=None) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, gripper_pos=curr_gp)
+
+        active_idx = self._active_cube_idx(prev_env)
+        if active_idx is None:
+            return 0.0
+
+        was_grasped = prev_env.is_grasped(active_idx)
+        is_grasped = curr_env.is_grasped(active_idx)
+        if not (was_grasped and not is_grasped):
+            return 0.0
+
+        release_dist = curr_env.cubes[active_idx].distance_to_goal()
+        if release_dist <= self.success_threshold:
+            return V8_RELEASE_SUCCESS_BONUS
+        return -V8_RELEASE_FAR_PENALTY
 
     def compute_progress(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
                          gripper_pos: Optional[np.ndarray] = None) -> Tuple[float, int]:
@@ -689,11 +751,40 @@ class DenseRewardWrapper:
             next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
             shaping = shaping_coef * (discount * next_progress - curr_progress)
 
-            out[i] = (
-                base_rewards[i]
-                + shaping
-                + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+            out[i] = shaping + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+        return out
+
+    def compute_v8_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v8")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        base_rewards = ds['rewards']
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            gp = extract_gripper_pos(obs_data[i]) if obs_data is not None else None
+            next_gp = extract_gripper_pos(next_obs_data[i]) if next_obs_data is not None else None
+            curr_progress, _ = self.compute_progress(qpos_data[i], qvel, gripper_pos=gp)
+            next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
+            shaping = shaping_coef * (discount * next_progress - curr_progress)
+            event = self._v8_release_event(
+                prev_qpos=qpos_data[i],
+                curr_qpos=next_qpos_data[i],
+                prev_ob=obs_data[i] if obs_data is not None else None,
+                curr_ob=next_obs_data[i] if next_obs_data is not None else None,
             )
+            out[i] = shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
     def compute_dataset_rewards(
@@ -704,26 +795,38 @@ class DenseRewardWrapper:
         shaping_coef: float = 1.0,
     ) -> np.ndarray:
         """Compute dense rewards for a transition dataset via version-specific handlers."""
-        if self.version == 'v1':
-            return self.compute_v1_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
-        if self.version == 'v2':
-            return self.compute_v2_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
-        if self.version == 'v3':
-            return self.compute_v3_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
-        if self.version == 'v4':
-            return self.compute_v4_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
-        if self.version == 'v5':
-            return self.compute_v5_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
-        if self.version == 'v6':
-            return self.compute_v6_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
-        if self.version == 'v7':
-            return self.compute_v7_dataset_rewards(
-                ds,
-                discount=discount,
-                terminal_bonus=terminal_bonus,
-                shaping_coef=shaping_coef,
-            )
-        raise ValueError(f"Unknown version for dataset rewards: {self.version}")
+        saved_episode_init_positions = self.episode_init_positions
+        self.episode_init_positions = None
+        try:
+            if self.version == 'v1':
+                return self.compute_v1_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+            if self.version == 'v2':
+                return self.compute_v2_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+            if self.version == 'v3':
+                return self.compute_v3_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus)
+            if self.version == 'v4':
+                return self.compute_v4_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
+            if self.version == 'v5':
+                return self.compute_v5_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
+            if self.version == 'v6':
+                return self.compute_v6_dataset_rewards(ds, discount=discount, terminal_bonus=terminal_bonus, shaping_coef=shaping_coef)
+            if self.version == 'v7':
+                return self.compute_v7_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v8':
+                return self.compute_v8_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            raise ValueError(f"Unknown version for dataset rewards: {self.version}")
+        finally:
+            self.episode_init_positions = saved_episode_init_positions
 
     def compute_v1_online_reward(
         self,
@@ -826,7 +929,27 @@ class DenseRewardWrapper:
         prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
         curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
         shaping = shaping_coef * (discount * curr_progress - prev_progress)
-        return float(env_reward + shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+        return float(shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v8_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+        prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
+        curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+        return float(shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
     def compute_online_reward(
         self,
@@ -897,6 +1020,17 @@ class DenseRewardWrapper:
             )
         if self.version == 'v7':
             return self.compute_v7_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v8':
+            return self.compute_v8_online_reward(
                 prev_qpos=prev_qpos,
                 curr_qpos=curr_qpos,
                 env_reward=env_reward,

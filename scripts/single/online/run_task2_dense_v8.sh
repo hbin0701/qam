@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run QAM-EDIT on Single-Play Task 2 with DENSE V2 reward (ONLINE-ONLY)
+# Run QAM-EDIT on Single-Play Task 2 with DENSE V8 reward (ONLINE-ONLY)
 
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.20
@@ -11,9 +11,9 @@ export PYTHONPATH="/rlwrld3/home/hyeonbin/RL/ogbench:${PYTHONPATH:-}"
 MUJOCO_GL=egl python main.py \
     --run_group=single_task2_rewards_online \
     --project=0217-single-tmp4 \
-    --run_name=SINGLE_QAM_EDIT_ONLINE_V2.10_Seed10001 \
+    --run_name=SINGLE_QAM_EDIT_ONLINE_V8.10_Seed10001 \
     --agent=agents/qam.py \
-    --tags=QAM_EDIT,dense_v2,single,online \
+    --tags=QAM_EDIT,dense_v8,single,online \
     --seed=10001 \
     --env_name=cube-single-play-singletask-task2-v0 \
     --cube_success_threshold=0.02 \
@@ -21,7 +21,7 @@ MUJOCO_GL=egl python main.py \
     --randomize_task_init_cube_pos=True \
     --ogbench_dataset_dir=/rlwrld3/home/hyeonbin/.ogbench/data/cube-single-play-1m \
     --sparse=False \
-    --dense_reward_version=v2 \
+    --dense_reward_version=v8 \
     --terminal_bonus=10 \
     --dense_shaping_lambda=20 \
     --horizon_length=5 \

@@ -47,6 +47,24 @@ MUJOCO_GL=egl python main.py --run_group=reproduce --agent=agents/qam.py --tags=
 ## How do I obtain the 100M for puzzle-4x4 and cube-quadruple?
 Please follow the instructions [here](https://github.com/seohongpark/horizon-reduction?tab=readme-ov-file#using-large-datasets) to obtain the large datasets.
 
+## Dense reward versions (current implementation)
+The code supports dense reward versions configured with `--dense_reward_version`.
+
+- `v1`: count-based progress (number of cubes currently at goal) with terminal success bonus.
+- `v2`: continuous distance-to-goal progress (`progress_to_goal`) with threshold-aware saturation and terminal success bonus.
+- `v3`: staged sequential progress (reach -> place on active cube), threshold-aware place progress, plus terminal success bonus.
+- `v4`: delta shaping built on v2 progress:
+  `r = base_env_reward + lambda * (gamma * P_next - P_curr) + success_bonus`
+- `v5`: delta shaping built on v3 progress:
+  `r = base_env_reward + lambda * (gamma * P_next - P_curr) + success_bonus`
+- `v6`: pick-place style staged progress (move-to-object, grasp, move-to-goal, release), delta-shaped with base reward and terminal success bonus.
+- `v7`: pick-place style staged progress (move-to-object, grasp, move-to-goal), delta-shaped with terminal success bonus.
+  In current code, base step reward is removed for `v7` (i.e., no environment step-penalty term added).
+
+Notes:
+- `cube_success_threshold` is configurable (`--cube_success_threshold`) and used consistently in env success checks and dense reward computations.
+- For online/eval with randomized starts, per-episode initial cube positions are taken from actual reset state for progress computation.
+
 ## Acknowledgments
 This codebase is built on top of [QC](https://github.com/colinqiyangli/qc).
 

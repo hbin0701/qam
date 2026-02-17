@@ -7,6 +7,7 @@ from functools import partial
 from contextlib import contextmanager
 import fcntl
 import os
+from envs.rewards.cube_dense_reward import extract_gripper_pos
 
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
@@ -78,6 +79,7 @@ def evaluate(
     dense_discount=0.99,
     dense_terminal_bonus=50.0,
     dense_shaping_lambda=10.0,
+    eval_seed=None,
 ):
     """Evaluate the agent in the environment.
 
@@ -104,18 +106,40 @@ def evaluate(
 
     renders = []
     render_reward_traces = []
+    render_progress_traces = []
+    render_potential_diff_traces = []
     render_frame_steps = []
+    progress_video_enabled = (
+        dense_wrapper is not None
+        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8")
+    )
+    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) == "v8"
+    saved_episode_init_positions = None
+    if dense_wrapper is not None:
+        saved_episode_init_positions = getattr(dense_wrapper, "episode_init_positions", None)
+        if saved_episode_init_positions is not None:
+            saved_episode_init_positions = saved_episode_init_positions.copy()
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
-        observation, info = env.reset()
+        if eval_seed is not None:
+            try:
+                observation, info = env.reset(seed=int(eval_seed + i))
+            except TypeError:
+                observation, info = env.reset()
+        else:
+            observation, info = env.reset()
         prev_qpos_dense = None
         if dense_wrapper is not None:
             try:
                 prev_qpos_dense = env.unwrapped._data.qpos.copy()
+                dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
             except Exception:
                 prev_qpos_dense = None
+        chunk_start_qpos_dense = None
+        chunk_start_ob_dense = None
+        chunk_step_count_dense = 0
             
         observation_history = []
         action_history = []
@@ -125,6 +149,8 @@ def evaluate(
         render = []
         render_steps = []
         reward_trace = []
+        progress_trace = []
+        potential_diff_trace = []
         action_chunk_lens = defaultdict(lambda: 0)
 
         action_queue = []
@@ -141,6 +167,10 @@ def evaluate(
                 action_chunk_len = action.shape[0]
                 for a in action:
                     action_queue.append(a)
+                if v8_chunk_shaping and prev_qpos_dense is not None:
+                    chunk_start_qpos_dense = prev_qpos_dense.copy()
+                    chunk_start_ob_dense = np.array(observation, copy=True)
+                    chunk_step_count_dense = 0
             else:
                 have_new_action = False
             
@@ -157,8 +187,8 @@ def evaluate(
             elif dense_wrapper is not None and prev_qpos_dense is not None:
                 try:
                     curr_qpos_dense = env.unwrapped._data.qpos.copy()
-                    logged_reward = float(
-                        dense_wrapper.compute_online_reward(
+                    if v8_chunk_shaping:
+                        base_plus_events = dense_wrapper.compute_online_reward(
                             prev_qpos=prev_qpos_dense,
                             curr_qpos=curr_qpos_dense,
                             env_reward=float(reward),
@@ -166,12 +196,64 @@ def evaluate(
                             curr_ob=next_observation,
                             discount=dense_discount,
                             terminal_bonus=dense_terminal_bonus,
-                            shaping_coef=dense_shaping_lambda,
+                            shaping_coef=0.0,
                         )
-                    )
+                        chunk_step_count_dense += 1
+                        is_chunk_end = (len(action_queue) == 0) or done
+                        curr_gp = extract_gripper_pos(next_observation)
+                        curr_progress, _ = dense_wrapper.compute_progress(curr_qpos_dense, gripper_pos=curr_gp)
+                        chunk_potential_diff = 0.0
+                        if is_chunk_end and chunk_start_qpos_dense is not None and chunk_start_ob_dense is not None:
+                            prev_gp = extract_gripper_pos(chunk_start_ob_dense)
+                            prev_progress, _ = dense_wrapper.compute_progress(chunk_start_qpos_dense, gripper_pos=prev_gp)
+                            chunk_potential_diff = float(
+                                (dense_discount ** chunk_step_count_dense) * curr_progress - prev_progress
+                            )
+                        logged_reward = float(base_plus_events + dense_shaping_lambda * chunk_potential_diff)
+                        if progress_video_enabled:
+                            progress_trace.append(float(curr_progress))
+                            # For visualization, show the same chunk-level potential diff
+                            # value across all steps in this chunk.
+                            potential_diff_trace.append(np.nan)
+                            if is_chunk_end:
+                                fill_val = float(chunk_potential_diff)
+                                for back_i in range(chunk_step_count_dense):
+                                    idx = len(potential_diff_trace) - 1 - back_i
+                                    if idx >= 0:
+                                        potential_diff_trace[idx] = fill_val
+                        if is_chunk_end:
+                            chunk_start_qpos_dense = None
+                            chunk_start_ob_dense = None
+                            chunk_step_count_dense = 0
+                    else:
+                        if progress_video_enabled:
+                            prev_gp = extract_gripper_pos(observation)
+                            curr_gp = extract_gripper_pos(next_observation)
+                            prev_progress, _ = dense_wrapper.compute_progress(prev_qpos_dense, gripper_pos=prev_gp)
+                            curr_progress, _ = dense_wrapper.compute_progress(curr_qpos_dense, gripper_pos=curr_gp)
+                            progress_trace.append(float(curr_progress))
+                            potential_diff_trace.append(float(dense_discount * curr_progress - prev_progress))
+                        logged_reward = float(
+                            dense_wrapper.compute_online_reward(
+                                prev_qpos=prev_qpos_dense,
+                                curr_qpos=curr_qpos_dense,
+                                env_reward=float(reward),
+                                prev_ob=observation,
+                                curr_ob=next_observation,
+                                discount=dense_discount,
+                                terminal_bonus=dense_terminal_bonus,
+                                shaping_coef=dense_shaping_lambda,
+                            )
+                        )
                     prev_qpos_dense = curr_qpos_dense
                 except Exception:
                     logged_reward = float(reward)
+                    if progress_video_enabled:
+                        progress_trace.append(np.nan)
+                        potential_diff_trace.append(np.nan)
+            elif progress_video_enabled:
+                progress_trace.append(np.nan)
+                potential_diff_trace.append(np.nan)
             reward_trace.append(logged_reward)
 
             if should_render and (step % video_frame_skip == 0 or done) and not render_disabled:
@@ -229,13 +311,21 @@ def evaluate(
         else:
             renders.append(np.array(render))
             render_reward_traces.append(np.array(reward_trace, dtype=np.float32))
+            if progress_video_enabled:
+                render_progress_traces.append(np.array(progress_trace, dtype=np.float32))
+                render_potential_diff_traces.append(np.array(potential_diff_trace, dtype=np.float32))
             render_frame_steps.append(np.array(render_steps, dtype=np.int32))
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
+    if dense_wrapper is not None and hasattr(dense_wrapper, "episode_init_positions"):
+        dense_wrapper.episode_init_positions = saved_episode_init_positions
+
     render_data = {
         "reward_traces": render_reward_traces,
+        "progress_traces": render_progress_traces,
+        "potential_diff_traces": render_potential_diff_traces,
         "frame_steps": render_frame_steps,
     }
     return stats, trajs, renders, render_data
