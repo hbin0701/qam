@@ -60,6 +60,9 @@ The code supports dense reward versions configured with `--dense_reward_version`
 - `v6`: pick-place style staged progress (move-to-object, grasp, move-to-goal, release), delta-shaped with base reward and terminal success bonus.
 - `v7`: pick-place style staged progress (move-to-object, grasp, move-to-goal), delta-shaped with terminal success bonus.
   In current code, base step reward is removed for `v7` (i.e., no environment step-penalty term added).
+- `v8`: extends v7 with release-event shaping (bonus for good release, penalty for bad release) and terminal success bonus.
+  Base step reward is removed for `v8` as well. For online/eval rollout, `v8` shaping is chunk-aligned:
+  `r_shape = lambda * (gamma^k * P_end - P_start)` applied at chunk end (with `k` executed steps in the chunk).
 
 Notes:
 - `cube_success_threshold` is configurable (`--cube_success_threshold`) and used consistently in env success checks and dense reward computations.
