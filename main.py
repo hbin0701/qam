@@ -1,7 +1,7 @@
 import glob, tqdm, wandb, os, json, random, time, jax
 from absl import app, flags
 from ml_collections import config_flags
-from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
+from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger, JsonlLogger
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
@@ -80,15 +80,18 @@ def restore_csv_loggers(csv_loggers, save_dir):
             csv_logger.restore(os.path.join(save_dir, f"{prefix}_sv.csv"))
 
 class LoggingHelper:
-    def __init__(self, csv_loggers, wandb_logger):
+    def __init__(self, csv_loggers, jsonl_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
+        self.jsonl_loggers = jsonl_loggers
         self.wandb_logger = wandb_logger
         self.first_time = time.time()
         self.last_time = time.time()
 
     def log(self, data, prefix, step):
         assert prefix in self.csv_loggers, prefix
+        assert prefix in self.jsonl_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
+        self.jsonl_loggers[prefix].log(data, step=step)
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
@@ -271,6 +274,8 @@ def main(_):
         prefixes.append("online_agent")
     csv_loggers = {prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
                     for prefix in prefixes}
+    jsonl_loggers = {prefix: JsonlLogger(os.path.join(FLAGS.save_dir, f"{prefix}.jsonl"))
+                     for prefix in prefixes}
 
     if os.path.isdir(FLAGS.save_dir):
         print("trying to load from", FLAGS.save_dir)
@@ -306,6 +311,7 @@ def main(_):
 
     logger = LoggingHelper(
         csv_loggers=csv_loggers,
+        jsonl_loggers=jsonl_loggers,
         wandb_logger=wandb,
     )
 
@@ -646,6 +652,8 @@ def main(_):
 
     for key, csv_logger in logger.csv_loggers.items():
         csv_logger.close()
+    for key, jsonl_logger in logger.jsonl_loggers.items():
+        jsonl_logger.close()
 
     # a token to indicate a successfully finished run
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:

@@ -58,15 +58,21 @@ The code supports dense reward versions configured with `--dense_reward_version`
 - `v5`: delta shaping built on v3 progress:
   `r = base_env_reward + lambda * (gamma * P_next - P_curr) + success_bonus`
 - `v6`: pick-place style staged progress (move-to-object, grasp, move-to-goal, release), delta-shaped with base reward and terminal success bonus.
-- `v7`: pick-place style staged progress (move-to-object, grasp, move-to-goal), delta-shaped with terminal success bonus.
-  In current code, base step reward is removed for `v7` (i.e., no environment step-penalty term added).
-- `v8`: extends v7 with release-event shaping (bonus for good release, penalty for bad release) and terminal success bonus.
-  Base step reward is removed for `v8` as well. For online/eval rollout, `v8` shaping is chunk-aligned:
+- `v7`: pick-place style staged progress with 3 substages (move-to-object, grasp, move-to-goal),
+  delta shaping, stage-dependent per-step penalty, and terminal success bonus.
+  Current formulation:
+  `r = stage_penalty + lambda * (gamma * P_next - P_curr) + success_bonus`
+  where for 3 substages the per-cube substage penalty schedule is `-3, -2, -1`, scaled by number of incomplete cubes.
+- `v8`: `v7` + explicit release-event term (bonus for release near goal, penalty for far release):
+  `r = stage_penalty + lambda * (gamma * P_next - P_curr) + release_event + success_bonus`
+  For online/eval rollout, `v8` shaping is chunk-aligned:
   `r_shape = lambda * (gamma^k * P_end - P_start)` applied at chunk end (with `k` executed steps in the chunk).
 
 Notes:
 - `cube_success_threshold` is configurable (`--cube_success_threshold`) and used consistently in env success checks and dense reward computations.
 - For online/eval with randomized starts, per-episode initial cube positions are taken from actual reset state for progress computation.
+- JSONL logging is enabled alongside W&B; logs are saved under `--save_dir` (e.g. `train.jsonl`, `eval.jsonl`) with robust conversion of numpy/JAX values.
+- In single/online launch scripts (`v1`, `v7`, `v8`), training warmup is disabled via `--start_training=1` so online updates begin immediately.
 
 ## Acknowledgments
 This codebase is built on top of [QC](https://github.com/colinqiyangli/qc).

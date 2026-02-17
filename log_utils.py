@@ -1,6 +1,8 @@
 import os
 import tempfile
 from datetime import datetime
+import json
+from collections.abc import Mapping
 
 import absl.flags as flags
 import ml_collections
@@ -72,6 +74,64 @@ class CsvLogger:
         
         self.header = get_csv_header(self.path)
         self.file = open(self.path, 'a')
+
+
+class JsonlLogger:
+    """JSONL logger for structured metric logging."""
+
+    def __init__(self, path):
+        self.path = path
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.file = open(self.path, 'a')
+
+    @staticmethod
+    def _to_jsonable(v):
+        if isinstance(v, Mapping):
+            return {str(k): JsonlLogger._to_jsonable(val) for k, val in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [JsonlLogger._to_jsonable(x) for x in v]
+        if isinstance(v, (np.floating, np.integer)):
+            return v.item()
+        if isinstance(v, np.bool_):
+            return bool(v)
+        if isinstance(v, np.generic):
+            return v.item()
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if hasattr(v, "__array__"):
+            try:
+                arr = np.asarray(v)
+                if arr.ndim == 0:
+                    return arr.item()
+                return arr.tolist()
+            except Exception:
+                pass
+        if hasattr(v, "tolist"):
+            try:
+                return v.tolist()
+            except Exception:
+                pass
+        if hasattr(v, "item"):
+            try:
+                return v.item()
+            except Exception:
+                pass
+        if isinstance(v, (wandb.Image, wandb.Video, wandb.Histogram)):
+            return None
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v
+        return str(v)
+
+    def log(self, row, step):
+        payload = {'step': int(step), 'timestamp': datetime.utcnow().isoformat() + 'Z'}
+        for k, v in row.items():
+            payload[k] = self._to_jsonable(v)
+        self.file.write(json.dumps(payload, ensure_ascii=True) + '\n')
+        self.file.flush()
+
+    def close(self):
+        if self.file is not None:
+            self.file.close()
 
 
 def get_hash(s):

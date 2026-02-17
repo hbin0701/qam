@@ -31,6 +31,7 @@ MUJOCO_GL=egl python main.py \
     --agent.edit_scale=0.0 \
     --offline_steps=0 \
     --online_steps=500000 \
+    --start_training=1 \
     --eval_interval=2000 \
     --log_interval=5000 \
     --dataset_replace_interval=0 \
