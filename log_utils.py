@@ -6,7 +6,7 @@ import absl.flags as flags
 import ml_collections
 import numpy as np
 import wandb
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont
 import glob
 
 import shutil
@@ -200,20 +200,33 @@ def _draw_line(img, x0, y0, x1, y1, color):
     img[ys[valid], xs[valid]] = color
 
 
+def _format_tick(v):
+    """Format numeric axis ticks compactly."""
+    av = abs(float(v))
+    if av >= 100:
+        return f"{v:.0f}"
+    if av >= 10:
+        return f"{v:.1f}"
+    return f"{v:.2f}"
+
+
 def _make_reward_plot_frame(rewards, cursor_step, height, width):
     """Create a reward-vs-time plot image with a moving cursor line."""
-    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
     if rewards is None or len(rewards) == 0:
         return canvas
 
     # Plot margins.
-    left, right = 32, 10
-    top, bottom = 10, 24
+    left, right = 44, 14
+    top, bottom = 16, 30
     plot_w = max(1, width - left - right)
     plot_h = max(1, height - top - bottom)
 
+    # Plot area background.
+    canvas[top : top + plot_h + 1, left : left + plot_w + 1] = np.array([252, 252, 253], dtype=np.uint8)
+
     # Axes.
-    axis_color = np.array([80, 80, 80], dtype=np.uint8)
+    axis_color = np.array([92, 102, 112], dtype=np.uint8)
     _draw_line(canvas, left, top, left, top + plot_h, axis_color)
     _draw_line(canvas, left, top + plot_h, left + plot_w, top + plot_h, axis_color)
 
@@ -227,21 +240,60 @@ def _make_reward_plot_frame(rewards, cursor_step, height, width):
             r_min -= 1.0
             r_max += 1.0
 
+    # Grid + numeric ticks.
+    tick_color = np.array([170, 180, 190], dtype=np.uint8)
+    y_ticks = np.linspace(r_min, r_max, 5)
+    x_ticks = [0, max(0, n // 2), max(0, n - 1)]
+    for yv in y_ticks:
+        y = top + int(round((1.0 - (yv - r_min) / (r_max - r_min)) * plot_h))
+        _draw_line(canvas, left, y, left + plot_w, y, tick_color)
+    for xv in x_ticks:
+        x = left + int(round(xv * (plot_w / max(1, n - 1))))
+        _draw_line(canvas, x, top, x, top + plot_h, tick_color)
+
     # Reward curve.
-    curve_color = np.array([52, 120, 246], dtype=np.uint8)
+    curve_color = np.array([34, 119, 217], dtype=np.uint8)
     xs = left + np.round(np.arange(n) * (plot_w / max(1, n - 1))).astype(np.int32)
     ys = top + np.round((1.0 - (r - r_min) / (r_max - r_min)) * plot_h).astype(np.int32)
     ys = np.clip(ys, top, top + plot_h)
     for i in range(1, n):
+        # Slightly thicker line for readability in video.
+        _draw_line(canvas, xs[i - 1], ys[i - 1] + 1, xs[i], ys[i] + 1, curve_color)
         _draw_line(canvas, xs[i - 1], ys[i - 1], xs[i], ys[i], curve_color)
 
     # Moving cursor.
     cursor_step = int(np.clip(cursor_step, 0, n - 1))
     cx = left + int(round(cursor_step * (plot_w / max(1, n - 1))))
-    cursor_color = np.array([230, 30, 30], dtype=np.uint8)
+    cursor_color = np.array([234, 67, 53], dtype=np.uint8)
     _draw_line(canvas, cx, top, cx, top + plot_h, cursor_color)
 
-    return canvas
+    # Current point marker.
+    cy = top + int(round((1.0 - (r[cursor_step] - r_min) / (r_max - r_min)) * plot_h))
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            yy, xx = cy + dy, cx + dx
+            if 0 <= yy < height and 0 <= xx < width:
+                canvas[yy, xx] = cursor_color
+
+    # Add numeric axis labels and compact readout text.
+    img = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+    text_color = (65, 75, 85)
+
+    for yv in y_ticks:
+        y = top + int(round((1.0 - (yv - r_min) / (r_max - r_min)) * plot_h))
+        draw.text((4, y - 5), _format_tick(yv), fill=text_color, font=font)
+
+    for xv in x_ticks:
+        x = left + int(round(xv * (plot_w / max(1, n - 1))))
+        draw.text((x - 8, top + plot_h + 6), str(int(xv)), fill=text_color, font=font)
+
+    draw.text((left, 2), "reward", fill=text_color, font=font)
+    draw.text((left + plot_w - 74, 2), f"step {cursor_step}", fill=(90, 98, 108), font=font)
+    draw.text((left + plot_w - 74, 12), f"r {r[cursor_step]:.3f}", fill=(90, 98, 108), font=font)
+
+    return np.asarray(img, dtype=np.uint8)
 
 
 def get_wandb_video_with_reward(renders, reward_traces, frame_steps, n_cols=None, fps=15):

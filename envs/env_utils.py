@@ -88,7 +88,7 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
+def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, **env_kwargs):
     """Make offline RL environment and datasets.
 
     Args:
@@ -102,8 +102,8 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
 
     if 'singletask' in env_name:
         # OGBench.
-        env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
-        eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
+        env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, **env_kwargs)
+        eval_env = ogbench.make_env_and_datasets(env_name, env_only=True, **env_kwargs)
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         train_dataset = Dataset.create(**train_dataset)

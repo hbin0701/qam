@@ -73,6 +73,11 @@ def evaluate(
     observation_shape=None,
     action_dim=None,
     extra_sample_kwargs={},
+    sparse_reward=False,
+    dense_wrapper=None,
+    dense_discount=0.99,
+    dense_terminal_bonus=50.0,
+    dense_shaping_lambda=10.0,
 ):
     """Evaluate the agent in the environment.
 
@@ -105,6 +110,12 @@ def evaluate(
         should_render = i >= num_eval_episodes
 
         observation, info = env.reset()
+        prev_qpos_dense = None
+        if dense_wrapper is not None:
+            try:
+                prev_qpos_dense = env.unwrapped._data.qpos.copy()
+            except Exception:
+                prev_qpos_dense = None
             
         observation_history = []
         action_history = []
@@ -140,7 +151,28 @@ def evaluate(
             next_observation, reward, terminated, truncated, info = env.step(np.clip(action, -1, 1))
             done = terminated or truncated
             step += 1
-            reward_trace.append(float(reward))
+            logged_reward = float(reward)
+            if sparse_reward:
+                logged_reward = float((reward != 0.0) * -1.0)
+            elif dense_wrapper is not None and prev_qpos_dense is not None:
+                try:
+                    curr_qpos_dense = env.unwrapped._data.qpos.copy()
+                    logged_reward = float(
+                        dense_wrapper.compute_online_reward(
+                            prev_qpos=prev_qpos_dense,
+                            curr_qpos=curr_qpos_dense,
+                            env_reward=float(reward),
+                            prev_ob=observation,
+                            curr_ob=next_observation,
+                            discount=dense_discount,
+                            terminal_bonus=dense_terminal_bonus,
+                            shaping_coef=dense_shaping_lambda,
+                        )
+                    )
+                    prev_qpos_dense = curr_qpos_dense
+                except Exception:
+                    logged_reward = float(reward)
+            reward_trace.append(logged_reward)
 
             if should_render and (step % video_frame_skip == 0 or done) and not render_disabled:
                 try:

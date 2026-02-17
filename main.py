@@ -54,6 +54,11 @@ flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online re
 flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7), None for original rewards')
 flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v7).')
 flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_bool(
+    'randomize_task_init_cube_pos',
+    False,
+    'If True, randomize initial cube XY at reset for task-mode OGBench cube envs (single-cube only).',
+)
 
 def save_csv_loggers(csv_loggers, save_dir):
     for prefix, csv_logger in csv_loggers.items():
@@ -112,9 +117,13 @@ def main(_):
             dataset_path=dataset_paths[dataset_idx],
             compact_dataset=False,
             add_info=(FLAGS.dense_reward_version is not None),  # Load qpos/qvel for dense rewards
+            randomize_task_init=FLAGS.randomize_task_init_cube_pos,
         )
     else:
-        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
+        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(
+            FLAGS.env_name,
+            randomize_task_init=FLAGS.randomize_task_init_cube_pos,
+        )
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -322,6 +331,11 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
+                sparse_reward=FLAGS.sparse,
+                dense_wrapper=dense_wrapper,
+                dense_discount=FLAGS.agent.discount,
+                dense_terminal_bonus=FLAGS.terminal_bonus,
+                dense_shaping_lambda=FLAGS.dense_shaping_lambda,
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
@@ -495,6 +509,11 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
+                sparse_reward=FLAGS.sparse,
+                dense_wrapper=dense_wrapper,
+                dense_discount=FLAGS.agent.discount,
+                dense_terminal_bonus=FLAGS.terminal_bonus,
+                dense_shaping_lambda=FLAGS.dense_shaping_lambda,
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:

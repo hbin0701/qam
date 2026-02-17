@@ -26,5 +26,6 @@ export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
 # One task per allocated GPU.
 export CUDA_VISIBLE_DEVICES=0
 export MUJOCO_EGL_DEVICE_ID=0
+export PYTHONPATH="/rlwrld3/home/hyeonbin/RL/ogbench:${PYTHONPATH:-}"
 
 bash scripts/triple/online/run_task2_dense_v7.sh
