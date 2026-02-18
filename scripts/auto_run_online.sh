@@ -6,8 +6,8 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_DIR}"
 
 targets=(
-  "scripts/slurm/single/online"
-  # "scripts/slurm/double/online"
+  # "scripts/slurm/single/online"
+  "scripts/slurm/double/online"
   # "scripts/slurm/triple/online"
 )
 

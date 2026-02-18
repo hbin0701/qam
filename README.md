@@ -67,12 +67,14 @@ The code supports dense reward versions configured with `--dense_reward_version`
   `r = stage_penalty + lambda * (gamma * P_next - P_curr) + release_event + success_bonus`
   For online/eval rollout, `v8` shaping is chunk-aligned:
   `r_shape = lambda * (gamma^k * P_end - P_start)` applied at chunk end (with `k` executed steps in the chunk).
+- `v9`: `v8` without progress-potential shaping and without release event:
+  `r = stage_penalty + success_bonus`
 
 Notes:
 - `cube_success_threshold` is configurable (`--cube_success_threshold`) and used consistently in env success checks and dense reward computations.
 - For online/eval with randomized starts, per-episode initial cube positions are taken from actual reset state for progress computation.
 - JSONL logging is enabled alongside W&B; logs are saved under `--save_dir` (e.g. `train.jsonl`, `eval.jsonl`) with robust conversion of numpy/JAX values.
-- In single/online launch scripts (`v1`, `v7`, `v8`), training warmup is disabled via `--start_training=1` so online updates begin immediately.
+- In single/online launch scripts (`v1`, `v7`, `v8`, `v9`), training warmup is disabled via `--start_training=1` so online updates begin immediately.
 
 ## Acknowledgments
 This codebase is built on top of [QC](https://github.com/colinqiyangli/qc).

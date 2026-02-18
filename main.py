@@ -51,8 +51,8 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
-flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8), None for original rewards')
-flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v8).')
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v9).')
 flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
 flags.DEFINE_bool(
     'randomize_task_init_cube_pos',
@@ -378,7 +378,7 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),
@@ -637,7 +637,7 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),

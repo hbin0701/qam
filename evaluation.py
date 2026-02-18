@@ -111,7 +111,7 @@ def evaluate(
     render_frame_steps = []
     progress_video_enabled = (
         dense_wrapper is not None
-        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8")
+        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9")
     )
     v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) == "v8"
     saved_episode_init_positions = None

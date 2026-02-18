@@ -14,6 +14,8 @@ Reward versions:
 - v7: Pick-place style progress-delta (3 subtasks, no release stage)
       + placement event bonus/penalty + terminal bonus
 - v8: v7 + explicit release event bonus/penalty
+- v9: v8 without progress-potential shaping and without release event
+      (stage penalty + terminal bonus)
 """
 
 import re
@@ -460,6 +462,7 @@ PROGRESS_FNS = {
     'v6': progress_v6,  # Pick-place style delta shaping
     'v7': progress_v7,  # Pick-place without release stage
     'v8': progress_v7,  # v7 progress + explicit release event shaping
+    'v9': progress_v7,  # v8 structure without progress-potential shaping/event
 }
 
 
@@ -509,8 +512,8 @@ class DenseRewardWrapper:
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -521,7 +524,7 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8'):
+        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
@@ -533,7 +536,7 @@ class DenseRewardWrapper:
         - other versions keep centered form, range [-num_cubes, 0].
         """
         progress, _ = self.compute_progress(qpos, qvel, gripper_pos)
-        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8'):
+        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
@@ -584,7 +587,8 @@ class DenseRewardWrapper:
         release_dist = curr_env.cubes[active_idx].distance_to_goal()
         if release_dist <= self.success_threshold:
             return V8_RELEASE_SUCCESS_BONUS
-        return -V8_RELEASE_FAR_PENALTY
+        # Temporarily disable wrong-placement penalty for v8 release events.
+        return 0.0
 
     def _v7_v8_stage_penalty(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None, ob=None) -> float:
         """Stage-dependent step penalty for v7/v8, scaled by remaining cubes."""
@@ -600,10 +604,12 @@ class DenseRewardWrapper:
         order_pos = int(stage // num_substages)
         subtask_idx = int(stage % num_substages)
         num_incomplete = env.num_cubes - order_pos
-        # Generic schedule by substage count:
-        # for 3 substages -> -3, -2, -1; for 4 -> -4, -3, -2, -1.
-        subtask_penalty = -float(num_substages - subtask_idx)
-        return float(subtask_penalty * num_incomplete)
+        # Remaining-work penalty:
+        # penalty = -((num_incomplete - 1) * S + (S - subtask_idx))
+        # where S=num_substages.
+        remaining_full_substages = (num_incomplete - 1) * num_substages
+        current_subtask_penalty = num_substages - subtask_idx
+        return float(-(remaining_full_substages + current_subtask_penalty))
 
     def compute_progress(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
                          gripper_pos: Optional[np.ndarray] = None) -> Tuple[float, int]:
@@ -814,6 +820,28 @@ class DenseRewardWrapper:
             out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
+    def compute_v9_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v9")
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        next_obs_data = ds.get('next_observations', None)
+        out = np.zeros(len(next_qpos_data), dtype=np.float32)
+        for i in range(len(next_qpos_data)):
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            stage_penalty = self._v7_v8_stage_penalty(
+                qpos=next_qpos_data[i],
+                qvel=next_qvel,
+                ob=next_obs_data[i] if next_obs_data is not None else None,
+            )
+            out[i] = stage_penalty + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+        return out
+
     def compute_dataset_rewards(
         self,
         ds: Dict[str, np.ndarray],
@@ -846,6 +874,13 @@ class DenseRewardWrapper:
                 )
             if self.version == 'v8':
                 return self.compute_v8_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v9':
+                return self.compute_v9_dataset_rewards(
                     ds,
                     discount=discount,
                     terminal_bonus=terminal_bonus,
@@ -980,6 +1015,21 @@ class DenseRewardWrapper:
         event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
         return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
+    def compute_v9_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        stage_penalty = self._v7_v8_stage_penalty(qpos=curr_qpos, ob=curr_ob)
+        return float(stage_penalty + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
     def compute_online_reward(
         self,
         prev_qpos: np.ndarray,
@@ -1060,6 +1110,17 @@ class DenseRewardWrapper:
             )
         if self.version == 'v8':
             return self.compute_v8_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v9':
+            return self.compute_v9_online_reward(
                 prev_qpos=prev_qpos,
                 curr_qpos=curr_qpos,
                 env_reward=env_reward,

@@ -20,5 +20,7 @@ sleep 1
 bash scripts/single/online/run_task2_dense_v7.sh &
 sleep 1
 bash scripts/single/online/run_task2_dense_v8.sh &
+sleep 1
+bash scripts/single/online/run_task2_dense_v9.sh &
 
 wait

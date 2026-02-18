@@ -6,9 +6,9 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_DIR}"
 
 jobs=(
-  "scripts/slurm/single/online/v1.slurm"
-  "scripts/slurm/single/online/v7.slurm"
-  "scripts/slurm/single/online/v8.slurm"
+  "scripts/slurm/double/online/v1.slurm"
+  "scripts/slurm/double/online/v7.slurm"
+  "scripts/slurm/double/online/v8.slurm"
 )
 
 submitted=0
