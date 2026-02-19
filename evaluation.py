@@ -106,14 +106,15 @@ def evaluate(
 
     renders = []
     render_reward_traces = []
+    render_chunk_reward_traces = []
     render_progress_traces = []
     render_potential_diff_traces = []
     render_frame_steps = []
     progress_video_enabled = (
         dense_wrapper is not None
-        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9")
+        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9", "v10")
     )
-    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) == "v8"
+    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v8", "v10")
     saved_episode_init_positions = None
     if dense_wrapper is not None:
         saved_episode_init_positions = getattr(dense_wrapper, "episode_init_positions", None)
@@ -149,6 +150,7 @@ def evaluate(
         render = []
         render_steps = []
         reward_trace = []
+        chunk_reward_trace = []
         progress_trace = []
         potential_diff_trace = []
         action_chunk_lens = defaultdict(lambda: 0)
@@ -182,6 +184,7 @@ def evaluate(
             done = terminated or truncated
             step += 1
             logged_reward = float(reward)
+            chunk_reward_trace.append(np.nan)
             if sparse_reward:
                 logged_reward = float((reward != 0.0) * -1.0)
             elif dense_wrapper is not None and prev_qpos_dense is not None:
@@ -209,7 +212,14 @@ def evaluate(
                             chunk_potential_diff = float(
                                 (dense_discount ** chunk_step_count_dense) * curr_progress - prev_progress
                             )
-                        logged_reward = float(base_plus_events + dense_shaping_lambda * chunk_potential_diff)
+                        chunk_reward = float(dense_shaping_lambda * chunk_potential_diff)
+                        logged_reward = float(base_plus_events + chunk_reward)
+                        if is_chunk_end:
+                            fill_chunk = float(chunk_reward)
+                            for back_i in range(chunk_step_count_dense):
+                                idx = len(chunk_reward_trace) - 1 - back_i
+                                if idx >= 0:
+                                    chunk_reward_trace[idx] = fill_chunk
                         if progress_video_enabled:
                             progress_trace.append(float(curr_progress))
                             # For visualization, show the same chunk-level potential diff
@@ -255,6 +265,14 @@ def evaluate(
                 progress_trace.append(np.nan)
                 potential_diff_trace.append(np.nan)
             reward_trace.append(logged_reward)
+
+            if dense_wrapper is not None and prev_qpos_dense is not None:
+                try:
+                    num_success_cubes = dense_wrapper.count_success_cubes(prev_qpos_dense)
+                    info["num_success_cubes"] = float(num_success_cubes)
+                    info["success_cube_fraction"] = float(num_success_cubes / max(dense_wrapper.num_cubes, 1))
+                except Exception:
+                    pass
 
             if should_render and (step % video_frame_skip == 0 or done) and not render_disabled:
                 try:
@@ -311,6 +329,7 @@ def evaluate(
         else:
             renders.append(np.array(render))
             render_reward_traces.append(np.array(reward_trace, dtype=np.float32))
+            render_chunk_reward_traces.append(np.array(chunk_reward_trace, dtype=np.float32))
             if progress_video_enabled:
                 render_progress_traces.append(np.array(progress_trace, dtype=np.float32))
                 render_potential_diff_traces.append(np.array(potential_diff_trace, dtype=np.float32))
@@ -324,6 +343,7 @@ def evaluate(
 
     render_data = {
         "reward_traces": render_reward_traces,
+        "chunk_reward_traces": render_chunk_reward_traces,
         "progress_traces": render_progress_traces,
         "potential_diff_traces": render_potential_diff_traces,
         "frame_steps": render_frame_steps,

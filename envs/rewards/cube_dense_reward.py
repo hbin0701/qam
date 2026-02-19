@@ -16,6 +16,10 @@ Reward versions:
 - v8: v7 + explicit release event bonus/penalty
 - v9: v8 without progress-potential shaping and without release event
       (stage penalty + terminal bonus)
+- v10: v8-style reward with:
+       (1) continuous reach progress at threshold,
+       (2) hysteresis for reach->grasp switching,
+       (3) continuous lift progress at grasp threshold
 """
 
 import re
@@ -43,6 +47,12 @@ V6_GRIPPER_CLOSED_THRESHOLD = 0.50
 V6_GRIPPER_CLOSED_REF = 0.56
 V6_GRASP_LIFT_THRESHOLD = 0.008
 V6_GRASP_LIFT_TARGET = 0.02
+# v10 reach hysteresis tuned from dataset contact-distance statistics.
+V10_REACH_THRESHOLD_IN = 0.010
+V10_REACH_THRESHOLD_OUT = 0.015
+V10_GRASP_LIFT_THRESHOLD = 0.015
+V10_MIN_CARRY_LIFT = 0.025
+V10_LOWER_XY_THRESHOLD = 0.04
 V8_RELEASE_SUCCESS_BONUS = 0.5
 V8_RELEASE_FAR_PENALTY = 0.25
 
@@ -450,6 +460,97 @@ def progress_v7(env: CubeEnvModel) -> Tuple[float, int]:
     return (main_progress, stage)
 
 
+def _progress_v10(env: CubeEnvModel, prev_subtask: Optional[int] = None) -> Tuple[float, int, int]:
+    """V10 progress with continuity and reach-stage hysteresis."""
+    n = env.num_cubes
+
+    active_idx = None
+    order_pos = 0
+    for pos, idx in enumerate(env.cube_order):
+        if not env.cubes[idx].is_at_goal():
+            active_idx = idx
+            order_pos = pos
+            break
+
+    if active_idx is None:
+        done_stage = n * 3
+        return (float(done_stage), done_stage, done_stage)
+
+    cube = env.cubes[active_idx]
+    cube_goal_dist = cube.distance_to_goal()
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    # v10: require stronger lift before entering carry-to-goal stage.
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V10_GRASP_LIFT_THRESHOLD)
+
+    gripper_dist = None
+    if env.gripper_pos is not None:
+        gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+
+    # Hysteresis only for 0<->1 switching while not grasped.
+    if grasped:
+        subtask_idx = 2
+    elif gripper_dist is None:
+        subtask_idx = 1
+    else:
+        if prev_subtask in (0, 1):
+            within_reach = gripper_dist <= V10_REACH_THRESHOLD_OUT
+        else:
+            within_reach = gripper_dist <= V10_REACH_THRESHOLD_IN
+        subtask_idx = 1 if within_reach else 0
+
+    if subtask_idx == 0:
+        # Continuous at boundary: subprogress==1 exactly at v10 reach-in threshold.
+        reach_thr = V10_REACH_THRESHOLD_IN
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_eff = max(init_reach_dist - reach_thr, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        cur_eff = max(cur_reach_dist - reach_thr, 0.0)
+        subprogress = float(np.clip(1.0 - (cur_eff / init_eff), 0.0, 1.0))
+    elif subtask_idx == 1:
+        # Continuous at lift threshold.
+        lift_denom = max(V10_MIN_CARRY_LIFT - V10_GRASP_LIFT_THRESHOLD, 1e-6)
+        lift_eff = max(cube_lift - V10_GRASP_LIFT_THRESHOLD, 0.0)
+        lift_progress = float(np.clip(lift_eff / lift_denom, 0.0, 1.0))
+        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+    else:
+        # Carry/place stage:
+        # - Require meaningful lift to get carry credit.
+        # - Only reward lowering once XY is near the goal.
+        init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
+        effective_current_xy = max(cube_goal_xy_dist - env.success_threshold, 0.0)
+        effective_init_xy = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+        xy_progress = float(np.clip(1.0 - (effective_current_xy / effective_init_xy), 0.0, 1.0))
+
+        lift_gate = float(np.clip(
+            (cube_lift - V10_GRASP_LIFT_THRESHOLD) / max(V10_MIN_CARRY_LIFT - V10_GRASP_LIFT_THRESHOLD, 1e-6),
+            0.0,
+            1.0,
+        ))
+
+        lower_progress = 0.0
+        if cube_goal_xy_dist <= V10_LOWER_XY_THRESHOLD:
+            init_z = max(cube.initial_position[2] + V10_MIN_CARRY_LIFT, cube.goal_position[2] + 1e-6)
+            current_z = max(cube.position[2], cube.goal_position[2])
+            lower_progress = float(np.clip(
+                1.0 - (current_z - cube.goal_position[2]) / max(init_z - cube.goal_position[2], 1e-6),
+                0.0,
+                1.0,
+            ))
+
+        subprogress = 0.75 * (lift_gate * xy_progress) + 0.25 * lower_progress
+
+    main_progress = float(order_pos * 3) + float(subtask_idx) + float(np.clip(subprogress, 0.0, 1.0))
+    stage = order_pos * 3 + subtask_idx
+    return (main_progress, stage, subtask_idx)
+
+
+def progress_v10(env: CubeEnvModel) -> Tuple[float, int]:
+    progress, stage, _ = _progress_v10(env, prev_subtask=None)
+    return progress, stage
+
+
 # ============================================================
 # Unified DenseRewardWrapper
 # ============================================================
@@ -463,6 +564,7 @@ PROGRESS_FNS = {
     'v7': progress_v7,  # Pick-place without release stage
     'v8': progress_v7,  # v7 progress + explicit release event shaping
     'v9': progress_v7,  # v8 structure without progress-potential shaping/event
+    'v10': progress_v10,
 }
 
 
@@ -505,6 +607,7 @@ class DenseRewardWrapper:
         # Per-episode init positions (set from actual reset state for online/eval).
         # When set, these override static TASK_INITS.
         self.episode_init_positions: Optional[np.ndarray] = None
+        self._v10_prev_subtask: Optional[int] = None
 
         # Precompute cube ordering for v3/v5/v6: nearest cube to gripper home goes first
         if self.init_positions is not None:
@@ -512,8 +615,8 @@ class DenseRewardWrapper:
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -524,7 +627,7 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9'):
+        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
@@ -536,7 +639,7 @@ class DenseRewardWrapper:
         - other versions keep centered form, range [-num_cubes, 0].
         """
         progress, _ = self.compute_progress(qpos, qvel, gripper_pos)
-        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9'):
+        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
@@ -558,6 +661,31 @@ class DenseRewardWrapper:
             pos_start = 14 + i * 7
             init_positions.append(qpos[pos_start:pos_start + 3].copy())
         self.episode_init_positions = np.array(init_positions, dtype=np.float64)
+        self._v10_prev_subtask = None
+
+    @staticmethod
+    def _stage_penalty_from_stage(stage: int, num_cubes: int, num_substages: int = 3) -> float:
+        total_stages = num_cubes * num_substages
+        if stage >= total_stages:
+            return 0.0
+        order_pos = int(stage // num_substages)
+        subtask_idx = int(stage % num_substages)
+        num_incomplete = num_cubes - order_pos
+        remaining_full_substages = (num_incomplete - 1) * num_substages
+        current_subtask_penalty = num_substages - subtask_idx
+        return float(-(remaining_full_substages + current_subtask_penalty))
+
+    def _compute_v10_progress_with_state(
+        self,
+        qpos: np.ndarray,
+        qvel: Optional[np.ndarray] = None,
+        ob: Optional[np.ndarray] = None,
+        prev_subtask: Optional[int] = None,
+    ) -> Tuple[float, int, int]:
+        gp = extract_gripper_pos(ob) if ob is not None else None
+        env = self._make_env()
+        env.load_state(qpos, qvel=qvel, gripper_pos=gp)
+        return _progress_v10(env, prev_subtask=prev_subtask)
 
     @staticmethod
     def _active_cube_idx(env: CubeEnvModel) -> Optional[int]:
@@ -587,8 +715,7 @@ class DenseRewardWrapper:
         release_dist = curr_env.cubes[active_idx].distance_to_goal()
         if release_dist <= self.success_threshold:
             return V8_RELEASE_SUCCESS_BONUS
-        # Temporarily disable wrong-placement penalty for v8 release events.
-        return 0.0
+        return -V8_RELEASE_FAR_PENALTY
 
     def _v7_v8_stage_penalty(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None, ob=None) -> float:
         """Stage-dependent step penalty for v7/v8, scaled by remaining cubes."""
@@ -596,20 +723,7 @@ class DenseRewardWrapper:
         env = self._make_env()
         env.load_state(qpos, qvel=qvel, gripper_pos=gp)
         _, stage = progress_v7(env)
-        num_substages = 3
-        total_stages = env.num_cubes * num_substages
-        if stage >= total_stages:
-            return 0.0
-
-        order_pos = int(stage // num_substages)
-        subtask_idx = int(stage % num_substages)
-        num_incomplete = env.num_cubes - order_pos
-        # Remaining-work penalty:
-        # penalty = -((num_incomplete - 1) * S + (S - subtask_idx))
-        # where S=num_substages.
-        remaining_full_substages = (num_incomplete - 1) * num_substages
-        current_subtask_penalty = num_substages - subtask_idx
-        return float(-(remaining_full_substages + current_subtask_penalty))
+        return self._stage_penalty_from_stage(stage=stage, num_cubes=env.num_cubes, num_substages=3)
 
     def compute_progress(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
                          gripper_pos: Optional[np.ndarray] = None) -> Tuple[float, int]:
@@ -628,6 +742,12 @@ class DenseRewardWrapper:
         env = self._make_env()
         env.load_state(qpos, qvel=qvel, gripper_pos=None)
         return all(c.is_at_goal() for c in env.cubes)
+
+    def count_success_cubes(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None) -> int:
+        """Count cubes currently within success threshold."""
+        env = self._make_env()
+        env.load_state(qpos, qvel=qvel, gripper_pos=None)
+        return int(sum(c.is_at_goal() for c in env.cubes))
 
     def _success_bonus_post(self, next_qpos: np.ndarray, next_qvel: Optional[np.ndarray], terminal_bonus: float) -> float:
         """Post-success bonus: bonus_t = beta * 1[success(s_{t+1})]."""
@@ -842,6 +962,49 @@ class DenseRewardWrapper:
             out[i] = stage_penalty + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
         return out
 
+    def compute_v10_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v10")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_progress, _, prev_subtask = self._compute_v10_progress_with_state(
+                qpos=qpos_data[i], qvel=qvel, ob=prev_ob_i, prev_subtask=None
+            )
+            next_progress, next_stage, _ = self._compute_v10_progress_with_state(
+                qpos=next_qpos_data[i], qvel=next_qvel, ob=next_ob_i, prev_subtask=prev_subtask
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=3,
+            )
+            event = self._v8_release_event(
+                prev_qpos=qpos_data[i],
+                curr_qpos=next_qpos_data[i],
+                prev_ob=prev_ob_i,
+                curr_ob=next_ob_i,
+            )
+            out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+        return out
+
     def compute_dataset_rewards(
         self,
         ds: Dict[str, np.ndarray],
@@ -881,6 +1044,13 @@ class DenseRewardWrapper:
                 )
             if self.version == 'v9':
                 return self.compute_v9_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v10':
+                return self.compute_v10_dataset_rewards(
                     ds,
                     discount=discount,
                     terminal_bonus=terminal_bonus,
@@ -1030,6 +1200,34 @@ class DenseRewardWrapper:
         stage_penalty = self._v7_v8_stage_penalty(qpos=curr_qpos, ob=curr_ob)
         return float(stage_penalty + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
+    def compute_v10_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_qvel = None
+        curr_qvel = None
+        prev_subtask = self._v10_prev_subtask
+
+        prev_progress, _, prev_subtask_resolved = self._compute_v10_progress_with_state(
+            qpos=prev_qpos, qvel=prev_qvel, ob=prev_ob, prev_subtask=prev_subtask
+        )
+        curr_progress, curr_stage, curr_subtask = self._compute_v10_progress_with_state(
+            qpos=curr_qpos, qvel=curr_qvel, ob=curr_ob, prev_subtask=prev_subtask_resolved
+        )
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=3)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+        self._v10_prev_subtask = curr_subtask
+        return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
     def compute_online_reward(
         self,
         prev_qpos: np.ndarray,
@@ -1121,6 +1319,17 @@ class DenseRewardWrapper:
             )
         if self.version == 'v9':
             return self.compute_v9_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v10':
+            return self.compute_v10_online_reward(
                 prev_qpos=prev_qpos,
                 curr_qpos=curr_qpos,
                 env_reward=env_reward,

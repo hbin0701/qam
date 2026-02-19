@@ -51,9 +51,9 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
-flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9), None for original rewards')
-flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v9).')
-flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9/v10), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v10).')
+flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8/v10: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
 flags.DEFINE_bool(
     'randomize_task_init_cube_pos',
     False,
@@ -230,7 +230,7 @@ def main(_):
                 f"p99={dense_stats['p99']:.4f}, "
                 f"nonzero_frac={nonzero_frac:.4f}"
             )
-            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8"):
+            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8", "v10"):
                 print(
                     "Dense reward delta-mode check: "
                     f"mean_abs={dense_stats['mean_abs']:.6f}, "
@@ -374,11 +374,12 @@ def main(_):
                     renders,
                     render_data.get("reward_traces", []),
                     render_data.get("frame_steps", []),
+                    chunk_reward_traces=render_data.get("chunk_reward_traces", []),
                 )
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),
@@ -431,7 +432,7 @@ def main(_):
     prev_qpos_dense = env.unwrapped._data.qpos.copy() if dense_wrapper is not None else None
     if dense_wrapper is not None:
         dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
-    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version == "v8"
+    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version in ("v8", "v10")
     chunk_start_qpos_dense = None
     chunk_start_ob_dense = None
     chunk_step_count_dense = 0
@@ -498,6 +499,14 @@ def main(_):
         env_info["success_step"] = step_success
         env_info["success_steps_cum"] = float(online_success_steps)
         env_info["success_step_rate"] = float(online_success_steps / i)
+        if dense_wrapper is not None:
+            try:
+                curr_qpos_for_metrics = env.unwrapped._data.qpos.copy()
+                num_success_cubes = dense_wrapper.count_success_cubes(curr_qpos_for_metrics)
+                env_info["num_success_cubes"] = float(num_success_cubes)
+                env_info["success_cube_fraction"] = float(num_success_cubes / max(dense_wrapper.num_cubes, 1))
+            except Exception:
+                pass
         if done:
             online_episode_count += 1
             if current_episode_had_success:
@@ -633,11 +642,12 @@ def main(_):
                     renders,
                     render_data.get("reward_traces", []),
                     render_data.get("frame_steps", []),
+                    chunk_reward_traces=render_data.get("chunk_reward_traces", []),
                 )
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),

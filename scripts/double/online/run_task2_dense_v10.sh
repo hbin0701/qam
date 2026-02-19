@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run QAM-EDIT on Double-Play Task 2 with DENSE V8 reward (ONLINE-ONLY)
+# Run QAM-EDIT on Double-Play Task 2 with DENSE V10 reward (ONLINE-ONLY)
 
 # JAX Memory Management
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
@@ -12,17 +12,18 @@ export PYTHONPATH="/rlwrld3/home/hyeonbin/RL/ogbench:${PYTHONPATH:-}"
 MUJOCO_GL=egl python main.py \
     --run_group=double_task2_rewards_online \
     --project=0218-tmp \
-    --run_name=DOUBLE_QAM_EDIT_ONLINE_V8.12_Seed10001 \
+    --run_name=DOUBLE_QAM_EDIT_ONLINE_V10.16_Seed10001 \
     --agent=agents/qam.py \
-    --tags=QAM_EDIT,dense_v8,online \
+    --tags=QAM_EDIT,dense_v10,online \
     --seed=10001 \
     --env_name=cube-double-play-singletask-task2-v0 \
     --cube_success_threshold=0.02 \
     --randomize_task_init_cube_pos=True \
     --ogbench_dataset_dir=/rlwrld3/home/hyeonbin/.ogbench/data/cube-double-play-1m \
     --sparse=False \
-    --dense_reward_version=v8 \
+    --dense_reward_version=v10 \
     --terminal_bonus=10 \
+    --dense_shaping_lambda=10 \
     --horizon_length=5 \
     --agent.action_chunking=True \
     --agent.inv_temp=1.0 \
@@ -30,7 +31,7 @@ MUJOCO_GL=egl python main.py \
     --agent.edit_scale=0.0 \
     --offline_steps=0 \
     --online_steps=500000 \
-    --eval_interval=5000 \
+    --eval_interval=20000 \
     --log_interval=5000 \
     --dataset_replace_interval=0 \
     --video_episodes=1

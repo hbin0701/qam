@@ -442,13 +442,21 @@ def _make_metric_plot_frame(values, cursor_step, height, width, title):
     return np.asarray(img, dtype=np.uint8)
 
 
-def get_wandb_video_with_reward(renders, reward_traces, frame_steps, n_cols=None, fps=15):
-    """Return a W&B video with environment frames + synchronized reward-time plot.
+def get_wandb_video_with_reward(
+    renders,
+    reward_traces,
+    frame_steps,
+    chunk_reward_traces=None,
+    n_cols=None,
+    fps=15,
+):
+    """Return a W&B video with environment frames + synchronized reward plots.
 
     Args:
         renders: list of (t_i, h, w, c) uint8 arrays.
         reward_traces: list of (T_i,) reward arrays per episode.
         frame_steps: list of (t_i,) indices mapping each rendered frame to env step.
+        chunk_reward_traces: optional list of (T_i,) chunk-level reward arrays per episode.
     """
     if renders is None or len(renders) == 0:
         return None
@@ -458,11 +466,21 @@ def get_wandb_video_with_reward(renders, reward_traces, frame_steps, n_cols=None
         if len(render) == 0:
             continue
         rewards = reward_traces[i] if i < len(reward_traces) else np.zeros((1,), dtype=np.float32)
+        chunk_rewards = None
+        if chunk_reward_traces is not None and i < len(chunk_reward_traces):
+            chunk_rewards = chunk_reward_traces[i]
         steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
         episode_frames = []
         for j, frame in enumerate(render):
             step_idx = steps[j] if j < len(steps) else (len(rewards) - 1)
-            plot = _make_reward_plot_frame(rewards, step_idx, frame.shape[0], frame.shape[1])
+            if chunk_rewards is not None and len(chunk_rewards) > 0:
+                top_h = frame.shape[0] // 2
+                bottom_h = frame.shape[0] - top_h
+                reward_plot = _make_reward_plot_frame(rewards, step_idx, top_h, frame.shape[1])
+                chunk_plot = _make_metric_plot_frame(chunk_rewards, step_idx, bottom_h, frame.shape[1], "chunk_reward")
+                plot = np.concatenate([reward_plot, chunk_plot], axis=0)
+            else:
+                plot = _make_reward_plot_frame(rewards, step_idx, frame.shape[0], frame.shape[1])
             episode_frames.append(np.concatenate([frame, plot], axis=1))
         composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
 
