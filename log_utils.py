@@ -558,12 +558,13 @@ def get_wandb_video_with_z_values(
 def get_wandb_video_with_lift_progress(
     renders,
     cube_lift_traces,
-    gripper_width_traces,
+    gripper_metric_traces,
     frame_steps,
+    metric_name="gripper_width",
     n_cols=None,
     fps=15,
 ):
-    """Return a W&B video with frames + synchronized cube_lift/gripper_width plots."""
+    """Return a W&B video with frames + synchronized cube_lift/gripper metric plots."""
     if renders is None or len(renders) == 0:
         return None
 
@@ -572,7 +573,7 @@ def get_wandb_video_with_lift_progress(
         if len(render) == 0:
             continue
         cube_lift = cube_lift_traces[i] if i < len(cube_lift_traces) else np.zeros((1,), dtype=np.float32)
-        gripper_width = gripper_width_traces[i] if i < len(gripper_width_traces) else np.zeros((1,), dtype=np.float32)
+        gripper_metric = gripper_metric_traces[i] if i < len(gripper_metric_traces) else np.zeros((1,), dtype=np.float32)
         steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
         episode_frames = []
         for j, frame in enumerate(render):
@@ -580,7 +581,7 @@ def get_wandb_video_with_lift_progress(
             top_h = frame.shape[0] // 2
             bottom_h = frame.shape[0] - top_h
             lift_plot = _make_metric_plot_frame(cube_lift, step_idx, top_h, frame.shape[1], "cube_lift")
-            grip_plot = _make_metric_plot_frame(gripper_width, step_idx, bottom_h, frame.shape[1], "gripper_width")
+            grip_plot = _make_metric_plot_frame(gripper_metric, step_idx, bottom_h, frame.shape[1], metric_name)
             panel = np.concatenate([lift_plot, grip_plot], axis=0)
             episode_frames.append(np.concatenate([frame, panel], axis=1))
         composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))

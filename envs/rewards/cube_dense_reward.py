@@ -34,6 +34,8 @@ Reward versions:
 - v16: v15 with release event removed.
 - v17: v16 + subtask transition event shaping.
 - v18: v15 + latched lower-entry-Z per active cube (first stage-3 entry only).
+- v20: v18 semantics with gripper-closure driven by physical left/right
+       fingertip gap (meters) when available.
 """
 
 import re
@@ -78,6 +80,10 @@ V10_CARRY_STABLE_STEPS = 2
 V8_RELEASE_SUCCESS_BONUS = 0.5
 V8_RELEASE_FAR_PENALTY = 0.25
 V13_SUBTASK_TRANSITION_BONUS = 5.0
+# v20 gripper-gap normalization (meters):
+# close_score = clip((OPEN_REF - gap) / (OPEN_REF - CLOSED_REF), 0, 1)
+V20_GRIPPER_GAP_OPEN_REF = 0.10
+V20_GRIPPER_GAP_CLOSED_REF = 0.02
 
 
 def compute_cube_order(init_positions: np.ndarray, reference: np.ndarray = GRIPPER_HOME) -> List[int]:
@@ -96,6 +102,75 @@ def extract_gripper_pos(obs: np.ndarray) -> np.ndarray:
     obs[12:15] = (ee_pos - OBS_XYZ_CENTER) * OBS_XYZ_SCALER
     """
     return obs[12:15] / OBS_XYZ_SCALER + OBS_XYZ_CENTER
+
+
+def gripper_close_from_gap(gripper_gap_m: float) -> float:
+    """Map physical finger gap in meters to a close score in [0, 1]."""
+    denom = max(V20_GRIPPER_GAP_OPEN_REF - V20_GRIPPER_GAP_CLOSED_REF, 1e-6)
+    return float(np.clip((V20_GRIPPER_GAP_OPEN_REF - gripper_gap_m) / denom, 0.0, 1.0))
+
+
+def extract_gripper_gap_from_sim(env_unwrapped) -> Optional[float]:
+    """Best-effort left/right fingertip-gap extraction (meters) from MuJoCo state."""
+    model = getattr(env_unwrapped, "_model", None) or getattr(env_unwrapped, "model", None)
+    data = getattr(env_unwrapped, "_data", None) or getattr(env_unwrapped, "data", None)
+    if model is None or data is None:
+        return None
+
+    cache = getattr(env_unwrapped, "_qam_gripper_gap_pair", None)
+    if cache is None:
+        try:
+            import mujoco
+        except Exception:
+            return None
+
+        def _name2id(obj_type, name):
+            try:
+                return int(mujoco.mj_name2id(model, obj_type, name))
+            except Exception:
+                return -1
+
+        # Prefer explicit site pairs if present; fall back to silicone-pad body centers.
+        site_pairs = [
+            ("ur5e/robotiq/left_fingertip_site", "ur5e/robotiq/right_fingertip_site"),
+            ("ur5e/robotiq/left_fingertip", "ur5e/robotiq/right_fingertip"),
+            ("left_fingertip_site", "right_fingertip_site"),
+        ]
+        for left_name, right_name in site_pairs:
+            left_id = _name2id(mujoco.mjtObj.mjOBJ_SITE, left_name)
+            right_id = _name2id(mujoco.mjtObj.mjOBJ_SITE, right_name)
+            if left_id >= 0 and right_id >= 0:
+                cache = ("site", left_id, right_id)
+                break
+
+        if cache is None:
+            body_pairs = [
+                ("ur5e/robotiq/left_silicone_pad", "ur5e/robotiq/right_silicone_pad"),
+                ("ur5e/robotiq/left_pad", "ur5e/robotiq/right_pad"),
+            ]
+            for left_name, right_name in body_pairs:
+                left_id = _name2id(mujoco.mjtObj.mjOBJ_BODY, left_name)
+                right_id = _name2id(mujoco.mjtObj.mjOBJ_BODY, right_name)
+                if left_id >= 0 and right_id >= 0:
+                    cache = ("body", left_id, right_id)
+                    break
+
+        setattr(env_unwrapped, "_qam_gripper_gap_pair", cache)
+
+    if cache is None:
+        return None
+
+    kind, left_id, right_id = cache
+    try:
+        if kind == "site":
+            left = data.site_xpos[left_id]
+            right = data.site_xpos[right_id]
+        else:
+            left = data.xpos[left_id]
+            right = data.xpos[right_id]
+        return float(np.linalg.norm(left - right))
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -234,10 +309,12 @@ class CubeEnvModel:
         self.cube_order: List[int] = cube_order if cube_order is not None else list(range(num_cubes))
         # OGBench proxy in [0, 1]: 0=open, ~0.56=closed in these datasets.
         self.gripper_width: float = 0.0
+        self.gripper_gap_m: Optional[float] = None
         self.gripper_pos: Optional[np.ndarray] = None
 
     def load_state(self, qpos: np.ndarray, qvel: np.ndarray = None,
-                   gripper_pos: Optional[np.ndarray] = None):
+                   gripper_pos: Optional[np.ndarray] = None,
+                   gripper_gap_m: Optional[float] = None):
         """Load state from qpos vector.
 
         qpos layout: [arm_joints(6), gripper_joints(8), cube0_pos(3)+quat(4), cube1_pos(3)+quat(4), ...]
@@ -246,7 +323,11 @@ class CubeEnvModel:
         for i in range(self.num_cubes):
             pos_start = 14 + i * 7
             self.cubes[i].position = qpos[pos_start:pos_start + 3].copy()
-        self.gripper_width = float(np.clip(qpos[6] / 0.8, 0.0, 1.0))
+        self.gripper_gap_m = None if gripper_gap_m is None else float(gripper_gap_m)
+        if gripper_gap_m is not None:
+            self.gripper_width = gripper_close_from_gap(float(gripper_gap_m))
+        else:
+            self.gripper_width = float(np.clip(qpos[6] / 0.8, 0.0, 1.0))
         if gripper_pos is not None:
             self.gripper_pos = gripper_pos.copy()
 
@@ -1100,6 +1181,7 @@ PROGRESS_FNS = {
     'v16': progress_v16,
     'v17': progress_v17,
     'v18': progress_v18,
+    'v20': progress_v18,
     'v13': progress_v13,
     'v14': progress_v14,
 }
@@ -1175,6 +1257,10 @@ class DenseRewardWrapper:
         self._v18_lower_entry_z: Optional[float] = None
         self._v18_lower_entry_cube_idx: Optional[int] = None
         self._v18_lower_entry_xy_dist: Optional[float] = None
+        self._v20_prev_subtask: Optional[int] = None
+        self._v20_lower_entry_z: Optional[float] = None
+        self._v20_lower_entry_cube_idx: Optional[int] = None
+        self._v20_lower_entry_xy_dist: Optional[float] = None
 
         # Precompute cube ordering for v3/v5/v6: nearest cube to gripper home goes first
         if self.init_positions is not None:
@@ -1182,8 +1268,8 @@ class DenseRewardWrapper:
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -1194,19 +1280,20 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'):
+        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
     def compute_potential(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
-                          gripper_pos: Optional[np.ndarray] = None) -> float:
+                          gripper_pos: Optional[np.ndarray] = None,
+                          gripper_gap_m: Optional[float] = None) -> float:
         """Compute shaping potential/value from progress.
 
         - v2/v3 use raw progress P_v2(s)/P_v3(s), range [0, num_cubes].
         - other versions keep centered form, range [-num_cubes, 0].
         """
-        progress, _ = self.compute_progress(qpos, qvel, gripper_pos)
-        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'):
+        progress, _ = self.compute_progress(qpos, qvel, gripper_pos, gripper_gap_m=gripper_gap_m)
+        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
@@ -1259,6 +1346,10 @@ class DenseRewardWrapper:
         self._v18_lower_entry_z = None
         self._v18_lower_entry_cube_idx = None
         self._v18_lower_entry_xy_dist = None
+        self._v20_prev_subtask = None
+        self._v20_lower_entry_z = None
+        self._v20_lower_entry_cube_idx = None
+        self._v20_lower_entry_xy_dist = None
 
     @staticmethod
     def _stage_penalty_from_stage(stage: int, num_cubes: int, num_substages: int = 3) -> float:
@@ -1346,21 +1437,23 @@ class DenseRewardWrapper:
         return self._stage_penalty_from_stage(stage=stage, num_cubes=env.num_cubes, num_substages=3)
 
     def compute_progress(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
-                         gripper_pos: Optional[np.ndarray] = None) -> Tuple[float, int]:
+                         gripper_pos: Optional[np.ndarray] = None,
+                         gripper_gap_m: Optional[float] = None) -> Tuple[float, int]:
         """Compute progress for a single state."""
         env = self._make_env()
-        env.load_state(qpos, qvel, gripper_pos)
+        env.load_state(qpos, qvel, gripper_pos, gripper_gap_m=gripper_gap_m)
         return PROGRESS_FNS[self.version](env)
 
     def compute_progress_for_logging(
         self,
         qpos: np.ndarray,
         ob: Optional[np.ndarray] = None,
+        gripper_gap_m: Optional[float] = None,
     ) -> Tuple[float, int]:
         """Progress for visualization using current internal state (for stateful versions)."""
         gp = extract_gripper_pos(ob) if ob is not None else None
         env = self._make_env()
-        env.load_state(qpos, qvel=None, gripper_pos=gp)
+        env.load_state(qpos, qvel=None, gripper_pos=gp, gripper_gap_m=gripper_gap_m)
 
         if self.version == 'v11':
             p, s, _, _, _ = _progress_v11(
@@ -1439,8 +1532,18 @@ class DenseRewardWrapper:
                 lower_entry_xy_dist=self._v18_lower_entry_xy_dist,
             )
             return float(p), int(s)
+        if self.version == 'v20':
+            p, s, _, _, _, _ = _progress_v18(
+                env,
+                prev_subtask=self._v20_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v20_lower_entry_z,
+                lower_entry_cube_idx=self._v20_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v20_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
 
-        return self.compute_progress(qpos, qvel=None, gripper_pos=gp)
+        return self.compute_progress(qpos, qvel=None, gripper_pos=gp, gripper_gap_m=gripper_gap_m)
 
     def _require_keys(self, ds: Dict[str, np.ndarray], keys: List[str], ctx: str):
         missing = [k for k in keys if k not in ds]
@@ -2235,6 +2338,21 @@ class DenseRewardWrapper:
                 lower_entry_xy_dist_state = None
         return out
 
+    def compute_v20_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        """V20 reuses v18 dataset path (no MuJoCo fingertip gap in offline NPZ)."""
+        return self.compute_v18_dataset_rewards(
+            ds=ds,
+            discount=discount,
+            terminal_bonus=terminal_bonus,
+            shaping_coef=shaping_coef,
+        )
+
     def compute_v14_dataset_rewards(
         self,
         ds: Dict[str, np.ndarray],
@@ -2408,6 +2526,13 @@ class DenseRewardWrapper:
                 )
             if self.version == 'v18':
                 return self.compute_v18_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v20':
+                return self.compute_v20_dataset_rewards(
                     ds,
                     discount=discount,
                     terminal_bonus=terminal_bonus,
@@ -2953,6 +3078,55 @@ class DenseRewardWrapper:
         self._v18_lower_entry_xy_dist = lower_entry_xy_curr
         return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
+    def compute_v20_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        prev_gripper_gap_m: Optional[float] = None,
+        curr_gripper_gap_m: Optional[float] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp, gripper_gap_m=prev_gripper_gap_m)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp, gripper_gap_m=curr_gripper_gap_m)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
+            prev_env,
+            prev_subtask=self._v20_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v20_lower_entry_z,
+            lower_entry_cube_idx=self._v20_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v20_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v18(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+
+        self._v20_prev_subtask = curr_subtask
+        self._v20_lower_entry_z = lower_entry_z_curr
+        self._v20_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v20_lower_entry_xy_dist = lower_entry_xy_curr
+        return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
     def compute_online_reward(
         self,
         prev_qpos: np.ndarray,
@@ -2960,6 +3134,8 @@ class DenseRewardWrapper:
         env_reward: float,
         prev_ob: Optional[np.ndarray] = None,
         curr_ob: Optional[np.ndarray] = None,
+        prev_gripper_gap_m: Optional[float] = None,
+        curr_gripper_gap_m: Optional[float] = None,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
         shaping_coef: float = 1.0,
@@ -3148,6 +3324,19 @@ class DenseRewardWrapper:
                 env_reward=env_reward,
                 prev_ob=prev_ob,
                 curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v20':
+            return self.compute_v20_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                prev_gripper_gap_m=prev_gripper_gap_m,
+                curr_gripper_gap_m=curr_gripper_gap_m,
                 discount=discount,
                 terminal_bonus=terminal_bonus,
                 shaping_coef=shaping_coef,

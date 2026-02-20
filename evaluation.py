@@ -7,7 +7,7 @@ from functools import partial
 from contextlib import contextmanager
 import fcntl
 import os
-from envs.rewards.cube_dense_reward import extract_gripper_pos
+from envs.rewards.cube_dense_reward import extract_gripper_pos, extract_gripper_gap_from_sim
 
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
@@ -113,14 +113,15 @@ def evaluate(
     render_lower_entry_z_traces = []
     render_cube_lift_traces = []
     render_gripper_width_traces = []
+    gripper_metric_name = "gripper_gap_m" if (dense_wrapper is not None and getattr(dense_wrapper, "version", None) == "v20") else "gripper_width"
     render_frame_steps = []
     progress_video_enabled = (
         dense_wrapper is not None
-        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18")
+        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20")
     )
-    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18")
-    z_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18")
-    lift_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18")
+    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20")
+    z_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20")
+    lift_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20")
     saved_episode_init_positions = None
     if dense_wrapper is not None:
         saved_episode_init_positions = getattr(dense_wrapper, "episode_init_positions", None)
@@ -138,14 +139,18 @@ def evaluate(
         else:
             observation, info = env.reset()
         prev_qpos_dense = None
+        prev_gripper_gap_dense = None
         if dense_wrapper is not None:
             try:
                 prev_qpos_dense = env.unwrapped._data.qpos.copy()
+                prev_gripper_gap_dense = extract_gripper_gap_from_sim(env.unwrapped)
                 dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
             except Exception:
                 prev_qpos_dense = None
+                prev_gripper_gap_dense = None
         chunk_start_qpos_dense = None
         chunk_start_ob_dense = None
+        chunk_start_gripper_gap_dense = None
         chunk_step_count_dense = 0
             
         observation_history = []
@@ -184,12 +189,14 @@ def evaluate(
                 if v8_chunk_shaping and prev_qpos_dense is not None:
                     chunk_start_qpos_dense = prev_qpos_dense.copy()
                     chunk_start_ob_dense = np.array(observation, copy=True)
+                    chunk_start_gripper_gap_dense = prev_gripper_gap_dense
                     chunk_step_count_dense = 0
                     if progress_video_enabled:
                         try:
                             chunk_start_progress_vis, _ = dense_wrapper.compute_progress_for_logging(
                                 prev_qpos_dense,
                                 ob=observation,
+                                gripper_gap_m=prev_gripper_gap_dense,
                             )
                         except Exception:
                             chunk_start_progress_vis = None
@@ -211,6 +218,7 @@ def evaluate(
             elif dense_wrapper is not None and prev_qpos_dense is not None:
                 try:
                     curr_qpos_dense = env.unwrapped._data.qpos.copy()
+                    curr_gripper_gap_dense = extract_gripper_gap_from_sim(env.unwrapped)
                     if v8_chunk_shaping:
                         base_plus_events = dense_wrapper.compute_online_reward(
                             prev_qpos=prev_qpos_dense,
@@ -218,6 +226,8 @@ def evaluate(
                             env_reward=float(reward),
                             prev_ob=observation,
                             curr_ob=next_observation,
+                            prev_gripper_gap_m=prev_gripper_gap_dense,
+                            curr_gripper_gap_m=curr_gripper_gap_dense,
                             discount=dense_discount,
                             terminal_bonus=dense_terminal_bonus,
                             shaping_coef=0.0,
@@ -227,6 +237,7 @@ def evaluate(
                         curr_progress, _ = dense_wrapper.compute_progress_for_logging(
                             curr_qpos_dense,
                             ob=next_observation,
+                            gripper_gap_m=curr_gripper_gap_dense,
                         )
                         chunk_potential_diff = 0.0
                         if is_chunk_end and chunk_start_qpos_dense is not None and chunk_start_ob_dense is not None:
@@ -235,6 +246,7 @@ def evaluate(
                                 prev_progress, _ = dense_wrapper.compute_progress_for_logging(
                                     chunk_start_qpos_dense,
                                     ob=chunk_start_ob_dense,
+                                    gripper_gap_m=chunk_start_gripper_gap_dense,
                                 )
                             chunk_potential_diff = float(
                                 (dense_discount ** chunk_step_count_dense) * curr_progress - prev_progress
@@ -261,6 +273,7 @@ def evaluate(
                         if is_chunk_end:
                             chunk_start_qpos_dense = None
                             chunk_start_ob_dense = None
+                            chunk_start_gripper_gap_dense = None
                             chunk_step_count_dense = 0
                             chunk_start_progress_vis = None
                         prev_progress_for_vis = curr_progress
@@ -272,6 +285,8 @@ def evaluate(
                                 env_reward=float(reward),
                                 prev_ob=observation,
                                 curr_ob=next_observation,
+                                prev_gripper_gap_m=prev_gripper_gap_dense,
+                                curr_gripper_gap_m=curr_gripper_gap_dense,
                                 discount=dense_discount,
                                 terminal_bonus=dense_terminal_bonus,
                                 shaping_coef=dense_shaping_lambda,
@@ -281,16 +296,19 @@ def evaluate(
                             curr_progress, _ = dense_wrapper.compute_progress_for_logging(
                                 curr_qpos_dense,
                                 ob=next_observation,
+                                gripper_gap_m=curr_gripper_gap_dense,
                             )
                             if prev_progress_for_vis is None:
                                 prev_progress_for_vis, _ = dense_wrapper.compute_progress_for_logging(
                                     prev_qpos_dense,
                                     ob=observation,
+                                    gripper_gap_m=prev_gripper_gap_dense,
                                 )
                             progress_trace.append(float(curr_progress))
                             potential_diff_trace.append(float(dense_discount * curr_progress - prev_progress_for_vis))
                             prev_progress_for_vis = curr_progress
                     prev_qpos_dense = curr_qpos_dense
+                    prev_gripper_gap_dense = curr_gripper_gap_dense
                 except Exception:
                     logged_reward = float(reward)
                     if progress_video_enabled:
@@ -306,8 +324,9 @@ def evaluate(
                     if qpos_for_z is None:
                         qpos_for_z = env.unwrapped._data.qpos.copy()
                     gp_for_z = extract_gripper_pos(next_observation)
+                    gap_for_z = extract_gripper_gap_from_sim(env.unwrapped)
                     z_env = dense_wrapper._make_env()
-                    z_env.load_state(qpos_for_z, gripper_pos=gp_for_z)
+                    z_env.load_state(qpos_for_z, gripper_pos=gp_for_z, gripper_gap_m=gap_for_z)
                     active_idx = dense_wrapper._active_cube_idx(z_env)
                     cube_z = np.nan if active_idx is None else float(z_env.cubes[active_idx].position[2])
                     lower_entry_attr = f"_{dense_wrapper.version}_lower_entry_z"
@@ -323,15 +342,19 @@ def evaluate(
                     if qpos_for_lift is None:
                         qpos_for_lift = env.unwrapped._data.qpos.copy()
                     gp_for_lift = extract_gripper_pos(next_observation)
+                    gap_for_lift = extract_gripper_gap_from_sim(env.unwrapped)
                     lift_env = dense_wrapper._make_env()
-                    lift_env.load_state(qpos_for_lift, gripper_pos=gp_for_lift)
+                    lift_env.load_state(qpos_for_lift, gripper_pos=gp_for_lift, gripper_gap_m=gap_for_lift)
                     active_idx = dense_wrapper._active_cube_idx(lift_env)
                     if active_idx is None:
                         cube_lift = np.nan
                     else:
                         cube = lift_env.cubes[active_idx]
                         cube_lift = float(cube.position[2] - cube.initial_position[2])
-                    gripper_width = float(lift_env.gripper_width)
+                    if dense_wrapper is not None and getattr(dense_wrapper, "version", None) == "v20":
+                        gripper_width = float(gap_for_lift) if gap_for_lift is not None else np.nan
+                    else:
+                        gripper_width = float(lift_env.gripper_width)
                 except Exception:
                     cube_lift = np.nan
                     gripper_width = np.nan
@@ -428,6 +451,8 @@ def evaluate(
         "lower_entry_z_traces": render_lower_entry_z_traces,
         "cube_lift_traces": render_cube_lift_traces,
         "gripper_width_traces": render_gripper_width_traces,
+        "gripper_metric_traces": render_gripper_width_traces,
+        "gripper_metric_name": gripper_metric_name,
         "frame_steps": render_frame_steps,
     }
     return stats, trajs, renders, render_data
