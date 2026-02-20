@@ -377,11 +377,7 @@ def _make_metric_plot_frame(values, cursor_step, height, width, title):
     if r_raw.size == 0:
         return canvas
     finite = np.isfinite(r_raw)
-    if not np.any(finite):
-        r = np.zeros_like(r_raw)
-    else:
-        fallback = float(np.nanmean(r_raw[finite]))
-        r = np.where(finite, r_raw, fallback)
+    r = np.where(finite, r_raw, 0.0)
     n = len(r)
 
     if n == 1:
@@ -516,6 +512,76 @@ def get_wandb_video_with_progress(
             progress_plot = _make_metric_plot_frame(progresses, step_idx, top_h, frame.shape[1], "progress")
             pot_diff_plot = _make_metric_plot_frame(pot_diffs, step_idx, bottom_h, frame.shape[1], "potential_diff")
             panel = np.concatenate([progress_plot, pot_diff_plot], axis=0)
+            episode_frames.append(np.concatenate([frame, panel], axis=1))
+        composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
+
+    if len(composite_renders) == 0:
+        return None
+    return get_wandb_video(composite_renders, n_cols=n_cols, fps=fps)
+
+
+def get_wandb_video_with_z_values(
+    renders,
+    cube_z_traces,
+    lower_entry_z_traces,
+    frame_steps,
+    n_cols=None,
+    fps=15,
+):
+    """Return a W&B video with frames + synchronized cube_z/lower_entry_z plots."""
+    if renders is None or len(renders) == 0:
+        return None
+
+    composite_renders = []
+    for i, render in enumerate(renders):
+        if len(render) == 0:
+            continue
+        cube_z = cube_z_traces[i] if i < len(cube_z_traces) else np.zeros((1,), dtype=np.float32)
+        lower_entry_z = lower_entry_z_traces[i] if i < len(lower_entry_z_traces) else np.zeros((1,), dtype=np.float32)
+        steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
+        episode_frames = []
+        for j, frame in enumerate(render):
+            step_idx = steps[j] if j < len(steps) else (len(cube_z) - 1)
+            top_h = frame.shape[0] // 2
+            bottom_h = frame.shape[0] - top_h
+            cube_z_plot = _make_metric_plot_frame(cube_z, step_idx, top_h, frame.shape[1], "cube_z")
+            lower_entry_z_plot = _make_metric_plot_frame(lower_entry_z, step_idx, bottom_h, frame.shape[1], "lower_entry_z")
+            panel = np.concatenate([cube_z_plot, lower_entry_z_plot], axis=0)
+            episode_frames.append(np.concatenate([frame, panel], axis=1))
+        composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
+
+    if len(composite_renders) == 0:
+        return None
+    return get_wandb_video(composite_renders, n_cols=n_cols, fps=fps)
+
+
+def get_wandb_video_with_lift_progress(
+    renders,
+    cube_lift_traces,
+    gripper_width_traces,
+    frame_steps,
+    n_cols=None,
+    fps=15,
+):
+    """Return a W&B video with frames + synchronized cube_lift/gripper_width plots."""
+    if renders is None or len(renders) == 0:
+        return None
+
+    composite_renders = []
+    for i, render in enumerate(renders):
+        if len(render) == 0:
+            continue
+        cube_lift = cube_lift_traces[i] if i < len(cube_lift_traces) else np.zeros((1,), dtype=np.float32)
+        gripper_width = gripper_width_traces[i] if i < len(gripper_width_traces) else np.zeros((1,), dtype=np.float32)
+        steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
+        episode_frames = []
+        for j, frame in enumerate(render):
+            step_idx = steps[j] if j < len(steps) else (len(cube_lift) - 1)
+            top_h = frame.shape[0] // 2
+            bottom_h = frame.shape[0] - top_h
+            lift_plot = _make_metric_plot_frame(cube_lift, step_idx, top_h, frame.shape[1], "cube_lift")
+            grip_plot = _make_metric_plot_frame(gripper_width, step_idx, bottom_h, frame.shape[1], "gripper_width")
+            panel = np.concatenate([lift_plot, grip_plot], axis=0)
             episode_frames.append(np.concatenate([frame, panel], axis=1))
         composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
 

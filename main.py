@@ -51,9 +51,9 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
-flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9/v10), None for original rewards')
-flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v10).')
-flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8/v10: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v18).')
+flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
 flags.DEFINE_bool(
     'randomize_task_init_cube_pos',
     False,
@@ -230,7 +230,7 @@ def main(_):
                 f"p99={dense_stats['p99']:.4f}, "
                 f"nonzero_frac={nonzero_frac:.4f}"
             )
-            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8", "v10"):
+            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
                 print(
                     "Dense reward delta-mode check: "
                     f"mean_abs={dense_stats['mean_abs']:.6f}, "
@@ -368,7 +368,7 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress
+                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress, get_wandb_video_with_z_values, get_wandb_video_with_lift_progress
                 video = get_wandb_video(renders)
                 video_reward = get_wandb_video_with_reward(
                     renders,
@@ -379,7 +379,7 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),
@@ -388,6 +388,24 @@ def main(_):
                     )
                     if video_progress is not None:
                         payload['eval/video_progress'] = video_progress
+                if dense_wrapper is not None and dense_wrapper.version in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
+                    z_values_video = get_wandb_video_with_z_values(
+                        renders,
+                        render_data.get("cube_z_traces", []),
+                        render_data.get("lower_entry_z_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if z_values_video is not None:
+                        payload['eval/z_values'] = z_values_video
+                if dense_wrapper is not None and dense_wrapper.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
+                    lift_progress_video = get_wandb_video_with_lift_progress(
+                        renders,
+                        render_data.get("cube_lift_traces", []),
+                        render_data.get("gripper_width_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if lift_progress_video is not None:
+                        payload['eval/lift_progress'] = lift_progress_video
                 logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
@@ -432,7 +450,7 @@ def main(_):
     prev_qpos_dense = env.unwrapped._data.qpos.copy() if dense_wrapper is not None else None
     if dense_wrapper is not None:
         dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
-    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version in ("v8", "v10")
+    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18")
     chunk_start_qpos_dense = None
     chunk_start_ob_dense = None
     chunk_step_count_dense = 0
@@ -590,7 +608,8 @@ def main(_):
         else:
             ob = next_ob
 
-        if i >= FLAGS.start_training:
+        min_replay_for_sequence = FLAGS.horizon_length
+        if i >= FLAGS.start_training and replay_buffer.size >= min_replay_for_sequence:
 
             if FLAGS.balanced_sampling:
                 dataset_batch = train_dataset.sample_sequence(config['batch_size'] // 2 * FLAGS.utd_ratio, 
@@ -636,7 +655,7 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress
+                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress, get_wandb_video_with_z_values, get_wandb_video_with_lift_progress
                 video = get_wandb_video(renders)
                 video_reward = get_wandb_video_with_reward(
                     renders,
@@ -647,7 +666,7 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),
@@ -656,6 +675,24 @@ def main(_):
                     )
                     if video_progress is not None:
                         payload['eval/video_progress'] = video_progress
+                if dense_wrapper is not None and dense_wrapper.version in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
+                    z_values_video = get_wandb_video_with_z_values(
+                        renders,
+                        render_data.get("cube_z_traces", []),
+                        render_data.get("lower_entry_z_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if z_values_video is not None:
+                        payload['eval/z_values'] = z_values_video
+                if dense_wrapper is not None and dense_wrapper.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"):
+                    lift_progress_video = get_wandb_video_with_lift_progress(
+                        renders,
+                        render_data.get("cube_lift_traces", []),
+                        render_data.get("gripper_width_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if lift_progress_video is not None:
+                        payload['eval/lift_progress'] = lift_progress_video
                 logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")

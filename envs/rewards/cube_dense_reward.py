@@ -20,6 +20,20 @@ Reward versions:
        (1) continuous reach progress at threshold,
        (2) hysteresis for reach->grasp switching,
        (3) continuous lift progress at grasp threshold
+- v11: v10-style with extra lower stage:
+       reach -> grasp -> transport(XY) -> lower(Z). Lower activates only
+       inside XY success threshold and Z progress is normalized by the
+       entry-Z at XY-threshold crossing.
+- v12: v11 + wrong-XY penalty during lower stage:
+       lower-stage subprogress is in [-1, 1], starts at 0 on entry,
+       and becomes negative if XY distance increases from lower-stage entry.
+- v13: v11 + subtask transition event shaping (no release event):
+       +bonus for 1->2 and 2->3, same-magnitude penalty for 2->1 and 3->2.
+- v14: v13 with subtask transition event enabled.
+- v15: v12 + XY-worsening penalty during transport stage.
+- v16: v15 with release event removed.
+- v17: v16 + subtask transition event shaping.
+- v18: v15 + latched lower-entry-Z per active cube (first stage-3 entry only).
 """
 
 import re
@@ -48,13 +62,22 @@ V6_GRIPPER_CLOSED_REF = 0.56
 V6_GRASP_LIFT_THRESHOLD = 0.008
 V6_GRASP_LIFT_TARGET = 0.02
 # v10 reach hysteresis tuned from dataset contact-distance statistics.
-V10_REACH_THRESHOLD_IN = 0.010
-V10_REACH_THRESHOLD_OUT = 0.015
+V10_REACH_THRESHOLD_IN = 0.10
+V10_REACH_THRESHOLD_OUT = 0.10
 V10_GRASP_LIFT_THRESHOLD = 0.015
 V10_MIN_CARRY_LIFT = 0.025
 V10_LOWER_XY_THRESHOLD = 0.04
+V10_XY_WORSEN_EPS = 0.002
+V10_LIFT_DROP_EPS = 0.003
+V10_FALLBACK_XY_AWAY_THRESHOLD = 0.03
+V10_CLOSE_BAND_MIN = 0.50
+V10_CLOSE_BAND_MAX = 0.60
+V10_CLOSE_DECAY_SIGMA = 0.10
+V10_CARRY_LIFT_MARGIN = 0.005
+V10_CARRY_STABLE_STEPS = 2
 V8_RELEASE_SUCCESS_BONUS = 0.5
 V8_RELEASE_FAR_PENALTY = 0.25
+V13_SUBTASK_TRANSITION_BONUS = 5.0
 
 
 def compute_cube_order(init_positions: np.ndarray, reference: np.ndarray = GRIPPER_HOME) -> List[int]:
@@ -357,7 +380,7 @@ def progress_v6(env: CubeEnvModel) -> Tuple[float, int]:
         return (float(n), n * 4 - 1)
 
     cube = env.cubes[active_idx]
-    cube_goal_dist = cube.distance_to_goal()
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
     # Open-progress proxy for release stage: 1=open, 0=closed.
     gripper_open = float(np.clip((V6_GRIPPER_CLOSED_REF - env.gripper_width) / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
@@ -460,8 +483,111 @@ def progress_v7(env: CubeEnvModel) -> Tuple[float, int]:
     return (main_progress, stage)
 
 
-def _progress_v10(env: CubeEnvModel, prev_subtask: Optional[int] = None) -> Tuple[float, int, int]:
-    """V10 progress with continuity and reach-stage hysteresis."""
+def _v10_determine_current_subtask(
+    env: CubeEnvModel,
+    cube: CubeState,
+    prev_subtask: Optional[int],
+    gripper_dist: Optional[float],
+) -> Tuple[int, float, float]:
+    """Determine v10 subtask index and key features."""
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
+    # Match v8/v7 grasp condition exactly.
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+
+    if grasped:
+        return 2, cube_lift, cube_goal_xy_dist
+    if gripper_dist is None:
+        return 1, cube_lift, cube_goal_xy_dist
+
+    # Match v8/v7 reach->grasp switching exactly.
+    return (0 if gripper_dist > V6_REACH_THRESHOLD else 1), cube_lift, cube_goal_xy_dist
+
+
+def _v10_determine_progress_for_subtask(
+    env: CubeEnvModel,
+    cube: CubeState,
+    subtask_idx: int,
+    gripper_dist: Optional[float],
+    cube_lift: float,
+    cube_goal_xy_dist: float,
+) -> float:
+    """Compute v10 subprogress (v8-equivalent shaping)."""
+    if subtask_idx == 0:
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_reach_dist = max(init_reach_dist, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        return float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
+
+    if subtask_idx == 1:
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
+        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+        return 0.6 * lift_progress + 0.4 * close_progress
+
+    cube_goal_dist = float(np.linalg.norm(cube.position - cube.goal_position))
+    init_goal_dist = float(np.linalg.norm(cube.initial_position - cube.goal_position))
+    effective_current = max(cube_goal_dist - env.success_threshold, 0.0)
+    effective_init = max(init_goal_dist - env.success_threshold, 1e-6)
+    return float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
+
+
+def _v10_force_to_grasp(
+    progress_val: float,
+    stage_val: int,
+    env: CubeEnvModel,
+    cube: CubeState,
+) -> Tuple[float, int, int]:
+    """Force local stage to grasp/lift (subtask 1)."""
+    order_pos_local = int(stage_val // 3)
+    forced_subtask_local = 1
+    forced_subprogress_local = _v10_grasp_subprogress(
+        env,
+        float(cube.position[2] - cube.initial_position[2]),
+    )
+
+    progress_val = float(
+        order_pos_local * 3
+        + float(forced_subtask_local)
+        + float(np.clip(forced_subprogress_local, 0.0, 1.0))
+    )
+    stage_val = order_pos_local * 3 + forced_subtask_local
+    return progress_val, stage_val, forced_subtask_local
+
+
+def _v10_normalized_xy_distance(env: CubeEnvModel, cube: CubeState) -> float:
+    init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
+    effective_current_xy = max(
+        float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2])) - env.success_threshold,
+        0.0,
+    )
+    effective_init_xy = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+    return float(effective_current_xy / effective_init_xy)
+
+
+def _v10_transport_regressed(prev_env: CubeEnvModel, curr_env: CubeEnvModel, active_idx: int) -> bool:
+    prev_cube = prev_env.cubes[active_idx]
+    curr_cube = curr_env.cubes[active_idx]
+    prev_xy_dist = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+    curr_xy_dist = float(np.linalg.norm(curr_cube.position[:2] - curr_cube.goal_position[:2]))
+    prev_lift = float(prev_cube.position[2] - prev_cube.initial_position[2])
+    curr_lift = float(curr_cube.position[2] - curr_cube.initial_position[2])
+    xy_worsened = curr_xy_dist > (prev_xy_dist + V10_XY_WORSEN_EPS)
+    lowered_away = (
+        curr_lift < (prev_lift - V10_LIFT_DROP_EPS)
+        and curr_xy_dist > V10_FALLBACK_XY_AWAY_THRESHOLD
+    )
+    return bool(xy_worsened or lowered_away)
+
+
+def _progress_v10(
+    env: CubeEnvModel,
+    prev_subtask: Optional[int] = None,
+    prev_env: Optional[CubeEnvModel] = None,
+    carry_ok: Optional[bool] = None,
+) -> Tuple[float, int, int]:
+    """V10 progress, implemented as a self-contained v8/v7-equivalent path."""
+    _ = (prev_subtask, prev_env, carry_ok)  # Keep signature compatible with prior v10 API.
+
     n = env.num_cubes
 
     active_idx = None
@@ -477,69 +603,35 @@ def _progress_v10(env: CubeEnvModel, prev_subtask: Optional[int] = None) -> Tupl
         return (float(done_stage), done_stage, done_stage)
 
     cube = env.cubes[active_idx]
-    cube_goal_dist = cube.distance_to_goal()
     cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    # v10: require stronger lift before entering carry-to-goal stage.
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V10_GRASP_LIFT_THRESHOLD)
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
 
     gripper_dist = None
     if env.gripper_pos is not None:
         gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
 
-    # Hysteresis only for 0<->1 switching while not grasped.
-    if grasped:
-        subtask_idx = 2
-    elif gripper_dist is None:
-        subtask_idx = 1
+    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+        subtask_idx = 0  # move to object
+    elif not grasped:
+        subtask_idx = 1  # grasp object
     else:
-        if prev_subtask in (0, 1):
-            within_reach = gripper_dist <= V10_REACH_THRESHOLD_OUT
-        else:
-            within_reach = gripper_dist <= V10_REACH_THRESHOLD_IN
-        subtask_idx = 1 if within_reach else 0
+        subtask_idx = 2  # move to goal
 
     if subtask_idx == 0:
-        # Continuous at boundary: subprogress==1 exactly at v10 reach-in threshold.
-        reach_thr = V10_REACH_THRESHOLD_IN
         init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
-        init_eff = max(init_reach_dist - reach_thr, 1e-6)
+        init_reach_dist = max(init_reach_dist, 1e-6)
         cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
-        cur_eff = max(cur_reach_dist - reach_thr, 0.0)
-        subprogress = float(np.clip(1.0 - (cur_eff / init_eff), 0.0, 1.0))
+        subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
     elif subtask_idx == 1:
-        # Continuous at lift threshold.
-        lift_denom = max(V10_MIN_CARRY_LIFT - V10_GRASP_LIFT_THRESHOLD, 1e-6)
-        lift_eff = max(cube_lift - V10_GRASP_LIFT_THRESHOLD, 0.0)
-        lift_progress = float(np.clip(lift_eff / lift_denom, 0.0, 1.0))
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
         close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
         subprogress = 0.6 * lift_progress + 0.4 * close_progress
     else:
-        # Carry/place stage:
-        # - Require meaningful lift to get carry credit.
-        # - Only reward lowering once XY is near the goal.
         init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
-        effective_current_xy = max(cube_goal_xy_dist - env.success_threshold, 0.0)
-        effective_init_xy = max(init_goal_xy_dist - env.success_threshold, 1e-6)
-        xy_progress = float(np.clip(1.0 - (effective_current_xy / effective_init_xy), 0.0, 1.0))
-
-        lift_gate = float(np.clip(
-            (cube_lift - V10_GRASP_LIFT_THRESHOLD) / max(V10_MIN_CARRY_LIFT - V10_GRASP_LIFT_THRESHOLD, 1e-6),
-            0.0,
-            1.0,
-        ))
-
-        lower_progress = 0.0
-        if cube_goal_xy_dist <= V10_LOWER_XY_THRESHOLD:
-            init_z = max(cube.initial_position[2] + V10_MIN_CARRY_LIFT, cube.goal_position[2] + 1e-6)
-            current_z = max(cube.position[2], cube.goal_position[2])
-            lower_progress = float(np.clip(
-                1.0 - (current_z - cube.goal_position[2]) / max(init_z - cube.goal_position[2], 1e-6),
-                0.0,
-                1.0,
-            ))
-
-        subprogress = 0.75 * (lift_gate * xy_progress) + 0.25 * lower_progress
+        effective_current = max(cube_goal_xy_dist - env.success_threshold, 0.0)
+        effective_init = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+        subprogress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
 
     main_progress = float(order_pos * 3) + float(subtask_idx) + float(np.clip(subprogress, 0.0, 1.0))
     stage = order_pos * 3 + subtask_idx
@@ -549,6 +641,443 @@ def _progress_v10(env: CubeEnvModel, prev_subtask: Optional[int] = None) -> Tupl
 def progress_v10(env: CubeEnvModel) -> Tuple[float, int]:
     progress, stage, _ = _progress_v10(env, prev_subtask=None)
     return progress, stage
+
+
+def _progress_v11(
+    env: CubeEnvModel,
+    prev_subtask: Optional[int] = None,
+    prev_env: Optional[CubeEnvModel] = None,
+    lower_entry_z: Optional[float] = None,
+    lower_entry_cube_idx: Optional[int] = None,
+) -> Tuple[float, int, int, Optional[float], Optional[int]]:
+    """V11 progress with explicit lower stage after XY success."""
+    _ = prev_subtask
+    n = env.num_cubes
+
+    active_idx = None
+    order_pos = 0
+    for pos, idx in enumerate(env.cube_order):
+        if not env.cubes[idx].is_at_goal():
+            active_idx = idx
+            order_pos = pos
+            break
+
+    if active_idx is None:
+        done_stage = n * 4
+        return (float(done_stage), done_stage, done_stage, None, None)
+
+    if lower_entry_cube_idx != active_idx:
+        lower_entry_z = None
+
+    cube = env.cubes[active_idx]
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+
+    gripper_dist = None
+    if env.gripper_pos is not None:
+        gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+
+    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+        subtask_idx = 0
+    elif not grasped:
+        subtask_idx = 1
+    elif cube_goal_xy_dist > env.success_threshold:
+        subtask_idx = 2
+    else:
+        subtask_idx = 3
+
+    if subtask_idx == 0:
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_reach_dist = max(init_reach_dist, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+    elif subtask_idx == 1:
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
+        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+    elif subtask_idx == 2:
+        init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
+        effective_current = max(cube_goal_xy_dist - env.success_threshold, 0.0)
+        effective_init = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+        subprogress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+    else:
+        if lower_entry_z is None:
+            if prev_env is not None:
+                prev_cube = prev_env.cubes[active_idx]
+                prev_xy = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+                if prev_xy > prev_env.success_threshold:
+                    lower_entry_z = float(prev_cube.position[2])
+                else:
+                    lower_entry_z = float(cube.position[2])
+            else:
+                lower_entry_z = float(cube.position[2])
+        lower_entry_cube_idx = active_idx
+
+        goal_z = float(cube.goal_position[2])
+        entry_above = max(float(lower_entry_z - goal_z), 1e-6)
+        current_above = max(float(cube.position[2] - goal_z), 0.0)
+        subprogress = float(np.clip(1.0 - (current_above / entry_above), 0.0, 1.0))
+
+    main_progress = float(order_pos * 4) + float(subtask_idx) + float(np.clip(subprogress, 0.0, 1.0))
+    stage = order_pos * 4 + subtask_idx
+    return (main_progress, stage, subtask_idx, lower_entry_z, lower_entry_cube_idx)
+
+
+def progress_v11(env: CubeEnvModel) -> Tuple[float, int]:
+    progress, stage, _, _, _ = _progress_v11(env, prev_subtask=None)
+    return progress, stage
+
+
+def _progress_v12(
+    env: CubeEnvModel,
+    prev_subtask: Optional[int] = None,
+    prev_env: Optional[CubeEnvModel] = None,
+    lower_entry_z: Optional[float] = None,
+    lower_entry_cube_idx: Optional[int] = None,
+    lower_entry_xy_dist: Optional[float] = None,
+) -> Tuple[float, int, int, Optional[float], Optional[int], Optional[float]]:
+    """V12 progress: v11 with lower-stage XY-worsening penalty."""
+    _ = prev_subtask
+    n = env.num_cubes
+
+    active_idx = None
+    order_pos = 0
+    for pos, idx in enumerate(env.cube_order):
+        if not env.cubes[idx].is_at_goal():
+            active_idx = idx
+            order_pos = pos
+            break
+
+    if active_idx is None:
+        done_stage = n * 4
+        return (float(done_stage), done_stage, done_stage, None, None, None)
+
+    if lower_entry_cube_idx != active_idx:
+        lower_entry_z = None
+        lower_entry_xy_dist = None
+
+    cube = env.cubes[active_idx]
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+
+    gripper_dist = None
+    if env.gripper_pos is not None:
+        gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+
+    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+        subtask_idx = 0
+    elif not grasped:
+        subtask_idx = 1
+    elif cube_goal_xy_dist > env.success_threshold:
+        subtask_idx = 2
+    else:
+        subtask_idx = 3
+
+    if subtask_idx == 0:
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_reach_dist = max(init_reach_dist, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+        lower_entry_xy_dist = None
+    elif subtask_idx == 1:
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
+        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+        lower_entry_xy_dist = None
+    elif subtask_idx == 2:
+        init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
+        effective_current = max(cube_goal_xy_dist - env.success_threshold, 0.0)
+        effective_init = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+        subprogress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+        lower_entry_xy_dist = None
+    else:
+        if lower_entry_z is None:
+            if prev_env is not None:
+                prev_cube = prev_env.cubes[active_idx]
+                prev_xy = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+                if prev_xy > prev_env.success_threshold:
+                    lower_entry_z = float(prev_cube.position[2])
+                else:
+                    lower_entry_z = float(cube.position[2])
+            else:
+                lower_entry_z = float(cube.position[2])
+        if lower_entry_xy_dist is None:
+            # Entry point for lower stage starts from 0 subprogress.
+            lower_entry_xy_dist = cube_goal_xy_dist
+        lower_entry_cube_idx = active_idx
+
+        goal_z = float(cube.goal_position[2])
+        entry_above = max(float(lower_entry_z - goal_z), 1e-6)
+        current_above = max(float(cube.position[2] - goal_z), 0.0)
+        z_progress = float(np.clip(1.0 - (current_above / entry_above), 0.0, 1.0))
+
+        xy_increase = max(cube_goal_xy_dist - float(lower_entry_xy_dist), 0.0)
+        xy_penalty = float(xy_increase / max(env.success_threshold, 1e-6))
+        subprogress = float(np.clip(z_progress - xy_penalty, -1.0, 1.0))
+
+    main_progress = float(order_pos * 4) + float(subtask_idx) + float(np.clip(subprogress, -1.0, 1.0))
+    stage = order_pos * 4 + subtask_idx
+    return (main_progress, stage, subtask_idx, lower_entry_z, lower_entry_cube_idx, lower_entry_xy_dist)
+
+
+def progress_v12(env: CubeEnvModel) -> Tuple[float, int]:
+    progress, stage, _, _, _, _ = _progress_v12(env, prev_subtask=None)
+    return progress, stage
+
+
+def _progress_v15(
+    env: CubeEnvModel,
+    prev_subtask: Optional[int] = None,
+    prev_env: Optional[CubeEnvModel] = None,
+    lower_entry_z: Optional[float] = None,
+    lower_entry_cube_idx: Optional[int] = None,
+    lower_entry_xy_dist: Optional[float] = None,
+) -> Tuple[float, int, int, Optional[float], Optional[int], Optional[float]]:
+    """V15 progress: v12 + transport-stage XY-worsening penalty (no lower-stage XY penalty)."""
+    _ = prev_subtask
+    n = env.num_cubes
+
+    active_idx = None
+    order_pos = 0
+    for pos, idx in enumerate(env.cube_order):
+        if not env.cubes[idx].is_at_goal():
+            active_idx = idx
+            order_pos = pos
+            break
+
+    if active_idx is None:
+        done_stage = n * 4
+        return (float(done_stage), done_stage, done_stage, None, None, None)
+
+    if lower_entry_cube_idx != active_idx:
+        lower_entry_z = None
+        lower_entry_xy_dist = None
+
+    cube = env.cubes[active_idx]
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+
+    gripper_dist = None
+    if env.gripper_pos is not None:
+        gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+
+    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+        subtask_idx = 0
+    elif not grasped:
+        subtask_idx = 1
+    elif cube_goal_xy_dist > env.success_threshold:
+        subtask_idx = 2
+    else:
+        subtask_idx = 3
+
+    if subtask_idx == 0:
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_reach_dist = max(init_reach_dist, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+        lower_entry_xy_dist = None
+    elif subtask_idx == 1:
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
+        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+        lower_entry_xy_dist = None
+    elif subtask_idx == 2:
+        init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
+        effective_current = max(cube_goal_xy_dist - env.success_threshold, 0.0)
+        effective_init = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+        transport_progress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
+        xy_worsen_penalty = 0.0
+        if prev_env is not None:
+            prev_cube = prev_env.cubes[active_idx]
+            prev_xy_dist = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+            xy_increase = max(cube_goal_xy_dist - prev_xy_dist, 0.0)
+            xy_worsen_penalty = float(xy_increase / effective_init)
+        subprogress = float(np.clip(transport_progress - xy_worsen_penalty, -1.0, 1.0))
+        lower_entry_z = None
+        lower_entry_cube_idx = None
+        lower_entry_xy_dist = None
+    else:
+        if lower_entry_z is None:
+            if prev_env is not None:
+                prev_cube = prev_env.cubes[active_idx]
+                prev_xy = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+                if prev_xy > prev_env.success_threshold:
+                    lower_entry_z = float(prev_cube.position[2])
+                else:
+                    lower_entry_z = float(cube.position[2])
+            else:
+                lower_entry_z = float(cube.position[2])
+        if lower_entry_xy_dist is None:
+            lower_entry_xy_dist = cube_goal_xy_dist
+        lower_entry_cube_idx = active_idx
+
+        goal_z = float(cube.goal_position[2])
+        entry_above = max(float(lower_entry_z - goal_z), 1e-6)
+        current_above = max(float(cube.position[2] - goal_z), 0.0)
+        subprogress = float(np.clip(1.0 - (current_above / entry_above), 0.0, 1.0))
+
+    main_progress = float(order_pos * 4) + float(subtask_idx) + float(np.clip(subprogress, -1.0, 1.0))
+    stage = order_pos * 4 + subtask_idx
+    return (main_progress, stage, subtask_idx, lower_entry_z, lower_entry_cube_idx, lower_entry_xy_dist)
+
+
+def progress_v15(env: CubeEnvModel) -> Tuple[float, int]:
+    progress, stage, _, _, _, _ = _progress_v15(env, prev_subtask=None)
+    return progress, stage
+
+
+def progress_v16(env: CubeEnvModel) -> Tuple[float, int]:
+    """V16 shares the same progress definition as v15."""
+    return progress_v15(env)
+
+
+def progress_v17(env: CubeEnvModel) -> Tuple[float, int]:
+    """V17 shares the same progress definition as v15."""
+    return progress_v15(env)
+
+
+def _progress_v18(
+    env: CubeEnvModel,
+    prev_subtask: Optional[int] = None,
+    prev_env: Optional[CubeEnvModel] = None,
+    lower_entry_z: Optional[float] = None,
+    lower_entry_cube_idx: Optional[int] = None,
+    lower_entry_xy_dist: Optional[float] = None,
+) -> Tuple[float, int, int, Optional[float], Optional[int], Optional[float]]:
+    """V18 progress: v15 with latched lower-entry-Z per active cube."""
+    _ = prev_subtask
+    n = env.num_cubes
+
+    active_idx = None
+    order_pos = 0
+    for pos, idx in enumerate(env.cube_order):
+        if not env.cubes[idx].is_at_goal():
+            active_idx = idx
+            order_pos = pos
+            break
+
+    if active_idx is None:
+        done_stage = n * 4
+        return (float(done_stage), done_stage, done_stage, None, None, None)
+
+    # Reset latch only when active cube changes.
+    if lower_entry_cube_idx != active_idx:
+        lower_entry_z = None
+        lower_entry_xy_dist = None
+
+    cube = env.cubes[active_idx]
+    cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
+    cube_lift = float(cube.position[2] - cube.initial_position[2])
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+
+    gripper_dist = None
+    if env.gripper_pos is not None:
+        gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+
+    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+        subtask_idx = 0
+    elif not grasped:
+        subtask_idx = 1
+    elif cube_goal_xy_dist > env.success_threshold:
+        subtask_idx = 2
+    else:
+        subtask_idx = 3
+
+    if subtask_idx == 0:
+        init_reach_dist = float(np.linalg.norm(cube.initial_position - GRIPPER_HOME))
+        init_reach_dist = max(init_reach_dist, 1e-6)
+        cur_reach_dist = gripper_dist if gripper_dist is not None else init_reach_dist
+        subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
+    elif subtask_idx == 1:
+        lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
+        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+    elif subtask_idx == 2:
+        init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
+        effective_current = max(cube_goal_xy_dist - env.success_threshold, 0.0)
+        effective_init = max(init_goal_xy_dist - env.success_threshold, 1e-6)
+        transport_progress = float(np.clip(1.0 - (effective_current / effective_init), 0.0, 1.0))
+        xy_worsen_penalty = 0.0
+        if prev_env is not None:
+            prev_cube = prev_env.cubes[active_idx]
+            prev_xy_dist = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+            xy_increase = max(cube_goal_xy_dist - prev_xy_dist, 0.0)
+            xy_worsen_penalty = float(xy_increase / effective_init)
+        subprogress = float(np.clip(transport_progress - xy_worsen_penalty, -1.0, 1.0))
+    else:
+        # Latch only first time entering lower stage for this active cube.
+        if lower_entry_z is None:
+            if prev_env is not None:
+                prev_cube = prev_env.cubes[active_idx]
+                prev_xy = float(np.linalg.norm(prev_cube.position[:2] - prev_cube.goal_position[:2]))
+                if prev_xy > prev_env.success_threshold:
+                    lower_entry_z = float(prev_cube.position[2])
+                else:
+                    lower_entry_z = float(cube.position[2])
+            else:
+                lower_entry_z = float(cube.position[2])
+            lower_entry_xy_dist = cube_goal_xy_dist
+            lower_entry_cube_idx = active_idx
+
+        goal_z = float(cube.goal_position[2])
+        entry_above = max(float(lower_entry_z - goal_z), 1e-6)
+        current_above = max(float(cube.position[2] - goal_z), 0.0)
+        subprogress = float(np.clip(1.0 - (current_above / entry_above), 0.0, 1.0))
+
+    main_progress = float(order_pos * 4) + float(subtask_idx) + float(np.clip(subprogress, -1.0, 1.0))
+    stage = order_pos * 4 + subtask_idx
+    return (main_progress, stage, subtask_idx, lower_entry_z, lower_entry_cube_idx, lower_entry_xy_dist)
+
+
+def progress_v18(env: CubeEnvModel) -> Tuple[float, int]:
+    progress, stage, _, _, _, _ = _progress_v18(env, prev_subtask=None)
+    return progress, stage
+
+
+def progress_v13(env: CubeEnvModel) -> Tuple[float, int]:
+    """V13 shares the same progress definition as v11."""
+    return progress_v11(env)
+
+
+def progress_v14(env: CubeEnvModel) -> Tuple[float, int]:
+    """V14 shares the same progress definition as v11."""
+    return progress_v11(env)
+
+
+def _v10_grasp_subprogress(env: CubeEnvModel, cube_lift: float) -> float:
+    """Subprogress for v10 grasp/lift stage."""
+    lift_denom = max(V10_MIN_CARRY_LIFT - V10_GRASP_LIFT_THRESHOLD, 1e-6)
+    lift_eff = max(cube_lift - V10_GRASP_LIFT_THRESHOLD, 0.0)
+    lift_progress = float(np.clip(lift_eff / lift_denom, 0.0, 1.0))
+
+    # Close-progress profile:
+    # - inside [0.5, 0.6] -> 1.0
+    # - outside band -> exponential decay by distance to band
+    gw = float(env.gripper_width)
+    d = max(V10_CLOSE_BAND_MIN - gw, gw - V10_CLOSE_BAND_MAX, 0.0)
+    sigma = max(V10_CLOSE_DECAY_SIGMA, 1e-6)
+    close_progress = float(np.exp(-((d / sigma) ** 2)))
+
+    return 0.6 * lift_progress + 0.4 * close_progress
 
 
 # ============================================================
@@ -565,6 +1094,14 @@ PROGRESS_FNS = {
     'v8': progress_v7,  # v7 progress + explicit release event shaping
     'v9': progress_v7,  # v8 structure without progress-potential shaping/event
     'v10': progress_v10,
+    'v11': progress_v11,
+    'v12': progress_v12,
+    'v15': progress_v15,
+    'v16': progress_v16,
+    'v17': progress_v17,
+    'v18': progress_v18,
+    'v13': progress_v13,
+    'v14': progress_v14,
 }
 
 
@@ -608,6 +1145,36 @@ class DenseRewardWrapper:
         # When set, these override static TASK_INITS.
         self.episode_init_positions: Optional[np.ndarray] = None
         self._v10_prev_subtask: Optional[int] = None
+        self._v10_carry_stable_steps: int = 0
+        self._v11_prev_subtask: Optional[int] = None
+        self._v11_lower_entry_z: Optional[float] = None
+        self._v11_lower_entry_cube_idx: Optional[int] = None
+        self._v12_prev_subtask: Optional[int] = None
+        self._v12_lower_entry_z: Optional[float] = None
+        self._v12_lower_entry_cube_idx: Optional[int] = None
+        self._v12_lower_entry_xy_dist: Optional[float] = None
+        self._v13_prev_subtask: Optional[int] = None
+        self._v13_lower_entry_z: Optional[float] = None
+        self._v13_lower_entry_cube_idx: Optional[int] = None
+        self._v14_prev_subtask: Optional[int] = None
+        self._v14_lower_entry_z: Optional[float] = None
+        self._v14_lower_entry_cube_idx: Optional[int] = None
+        self._v15_prev_subtask: Optional[int] = None
+        self._v15_lower_entry_z: Optional[float] = None
+        self._v15_lower_entry_cube_idx: Optional[int] = None
+        self._v15_lower_entry_xy_dist: Optional[float] = None
+        self._v16_prev_subtask: Optional[int] = None
+        self._v16_lower_entry_z: Optional[float] = None
+        self._v16_lower_entry_cube_idx: Optional[int] = None
+        self._v16_lower_entry_xy_dist: Optional[float] = None
+        self._v17_prev_subtask: Optional[int] = None
+        self._v17_lower_entry_z: Optional[float] = None
+        self._v17_lower_entry_cube_idx: Optional[int] = None
+        self._v17_lower_entry_xy_dist: Optional[float] = None
+        self._v18_prev_subtask: Optional[int] = None
+        self._v18_lower_entry_z: Optional[float] = None
+        self._v18_lower_entry_cube_idx: Optional[int] = None
+        self._v18_lower_entry_xy_dist: Optional[float] = None
 
         # Precompute cube ordering for v3/v5/v6: nearest cube to gripper home goes first
         if self.init_positions is not None:
@@ -615,8 +1182,8 @@ class DenseRewardWrapper:
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -627,7 +1194,7 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'):
+        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
@@ -639,7 +1206,7 @@ class DenseRewardWrapper:
         - other versions keep centered form, range [-num_cubes, 0].
         """
         progress, _ = self.compute_progress(qpos, qvel, gripper_pos)
-        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10'):
+        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
@@ -662,6 +1229,36 @@ class DenseRewardWrapper:
             init_positions.append(qpos[pos_start:pos_start + 3].copy())
         self.episode_init_positions = np.array(init_positions, dtype=np.float64)
         self._v10_prev_subtask = None
+        self._v10_carry_stable_steps = 0
+        self._v11_prev_subtask = None
+        self._v11_lower_entry_z = None
+        self._v11_lower_entry_cube_idx = None
+        self._v12_prev_subtask = None
+        self._v12_lower_entry_z = None
+        self._v12_lower_entry_cube_idx = None
+        self._v12_lower_entry_xy_dist = None
+        self._v13_prev_subtask = None
+        self._v13_lower_entry_z = None
+        self._v13_lower_entry_cube_idx = None
+        self._v14_prev_subtask = None
+        self._v14_lower_entry_z = None
+        self._v14_lower_entry_cube_idx = None
+        self._v15_prev_subtask = None
+        self._v15_lower_entry_z = None
+        self._v15_lower_entry_cube_idx = None
+        self._v15_lower_entry_xy_dist = None
+        self._v16_prev_subtask = None
+        self._v16_lower_entry_z = None
+        self._v16_lower_entry_cube_idx = None
+        self._v16_lower_entry_xy_dist = None
+        self._v17_prev_subtask = None
+        self._v17_lower_entry_z = None
+        self._v17_lower_entry_cube_idx = None
+        self._v17_lower_entry_xy_dist = None
+        self._v18_prev_subtask = None
+        self._v18_lower_entry_z = None
+        self._v18_lower_entry_cube_idx = None
+        self._v18_lower_entry_xy_dist = None
 
     @staticmethod
     def _stage_penalty_from_stage(stage: int, num_cubes: int, num_substages: int = 3) -> float:
@@ -681,11 +1278,26 @@ class DenseRewardWrapper:
         qvel: Optional[np.ndarray] = None,
         ob: Optional[np.ndarray] = None,
         prev_subtask: Optional[int] = None,
+        prev_qpos: Optional[np.ndarray] = None,
+        prev_qvel: Optional[np.ndarray] = None,
+        prev_ob: Optional[np.ndarray] = None,
+        use_stateful_carry_counter: bool = False,
     ) -> Tuple[float, int, int]:
-        gp = extract_gripper_pos(ob) if ob is not None else None
-        env = self._make_env()
-        env.load_state(qpos, qvel=qvel, gripper_pos=gp)
-        return _progress_v10(env, prev_subtask=prev_subtask)
+        def _load_env(state_qpos, state_qvel=None, state_ob=None):
+            gp_local = extract_gripper_pos(state_ob) if state_ob is not None else None
+            env_local = self._make_env()
+            env_local.load_state(state_qpos, qvel=state_qvel, gripper_pos=gp_local)
+            return env_local
+
+        curr_env = _load_env(qpos, qvel, ob)
+        prev_env = _load_env(prev_qpos, prev_qvel, prev_ob) if prev_qpos is not None else None
+
+        return _progress_v10(
+            curr_env,
+            prev_subtask=prev_subtask,
+            prev_env=prev_env, 
+            carry_ok=None,
+        )
 
     @staticmethod
     def _active_cube_idx(env: CubeEnvModel) -> Optional[int]:
@@ -717,6 +1329,14 @@ class DenseRewardWrapper:
             return V8_RELEASE_SUCCESS_BONUS
         return -V8_RELEASE_FAR_PENALTY
 
+    @staticmethod
+    def _v13_subtask_transition_event(prev_subtask: int, next_subtask: int) -> float:
+        if (prev_subtask, next_subtask) in ((1, 2), (2, 3)):
+            return V13_SUBTASK_TRANSITION_BONUS
+        if (prev_subtask, next_subtask) in ((2, 1), (3, 2)):
+            return -V13_SUBTASK_TRANSITION_BONUS
+        return 0.0
+
     def _v7_v8_stage_penalty(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None, ob=None) -> float:
         """Stage-dependent step penalty for v7/v8, scaled by remaining cubes."""
         gp = extract_gripper_pos(ob) if ob is not None else None
@@ -731,6 +1351,96 @@ class DenseRewardWrapper:
         env = self._make_env()
         env.load_state(qpos, qvel, gripper_pos)
         return PROGRESS_FNS[self.version](env)
+
+    def compute_progress_for_logging(
+        self,
+        qpos: np.ndarray,
+        ob: Optional[np.ndarray] = None,
+    ) -> Tuple[float, int]:
+        """Progress for visualization using current internal state (for stateful versions)."""
+        gp = extract_gripper_pos(ob) if ob is not None else None
+        env = self._make_env()
+        env.load_state(qpos, qvel=None, gripper_pos=gp)
+
+        if self.version == 'v11':
+            p, s, _, _, _ = _progress_v11(
+                env,
+                prev_subtask=self._v11_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v11_lower_entry_z,
+                lower_entry_cube_idx=self._v11_lower_entry_cube_idx,
+            )
+            return float(p), int(s)
+        if self.version == 'v12':
+            p, s, _, _, _, _ = _progress_v12(
+                env,
+                prev_subtask=self._v12_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v12_lower_entry_z,
+                lower_entry_cube_idx=self._v12_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v12_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
+        if self.version == 'v13':
+            p, s, _, _, _ = _progress_v11(
+                env,
+                prev_subtask=self._v13_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v13_lower_entry_z,
+                lower_entry_cube_idx=self._v13_lower_entry_cube_idx,
+            )
+            return float(p), int(s)
+        if self.version == 'v14':
+            p, s, _, _, _ = _progress_v11(
+                env,
+                prev_subtask=self._v14_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v14_lower_entry_z,
+                lower_entry_cube_idx=self._v14_lower_entry_cube_idx,
+            )
+            return float(p), int(s)
+        if self.version == 'v15':
+            p, s, _, _, _, _ = _progress_v15(
+                env,
+                prev_subtask=self._v15_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v15_lower_entry_z,
+                lower_entry_cube_idx=self._v15_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v15_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
+        if self.version == 'v16':
+            p, s, _, _, _, _ = _progress_v15(
+                env,
+                prev_subtask=self._v16_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v16_lower_entry_z,
+                lower_entry_cube_idx=self._v16_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v16_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
+        if self.version == 'v17':
+            p, s, _, _, _, _ = _progress_v15(
+                env,
+                prev_subtask=self._v17_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v17_lower_entry_z,
+                lower_entry_cube_idx=self._v17_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v17_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
+        if self.version == 'v18':
+            p, s, _, _, _, _ = _progress_v18(
+                env,
+                prev_subtask=self._v18_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v18_lower_entry_z,
+                lower_entry_cube_idx=self._v18_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v18_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
+
+        return self.compute_progress(qpos, qvel=None, gripper_pos=gp)
 
     def _require_keys(self, ds: Dict[str, np.ndarray], keys: List[str], ctx: str):
         missing = [k for k in keys if k not in ds]
@@ -980,21 +1690,80 @@ class DenseRewardWrapper:
         for i in range(len(qpos_data)):
             qvel = qvel_data[i] if qvel_data is not None else None
             next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            gp = extract_gripper_pos(obs_data[i]) if obs_data is not None else None
+            next_gp = extract_gripper_pos(next_obs_data[i]) if next_obs_data is not None else None
+            curr_progress, _ = self.compute_progress(qpos_data[i], qvel, gripper_pos=gp)
+            next_progress, _ = self.compute_progress(next_qpos_data[i], next_qvel, gripper_pos=next_gp)
+            shaping = shaping_coef * (discount * next_progress - curr_progress)
+            stage_penalty = self._v7_v8_stage_penalty(
+                qpos=next_qpos_data[i],
+                qvel=next_qvel,
+                ob=next_obs_data[i] if next_obs_data is not None else None,
+            )
+            event = self._v8_release_event(
+                prev_qpos=qpos_data[i],
+                curr_qpos=next_qpos_data[i],
+                prev_ob=obs_data[i] if obs_data is not None else None,
+                curr_ob=next_obs_data[i] if next_obs_data is not None else None,
+            )
+            out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+        return out
+
+    def compute_v11_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v11")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
             prev_ob_i = obs_data[i] if obs_data is not None else None
             next_ob_i = next_obs_data[i] if next_obs_data is not None else None
 
-            prev_progress, _, prev_subtask = self._compute_v10_progress_with_state(
-                qpos=qpos_data[i], qvel=qvel, ob=prev_ob_i, prev_subtask=None
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev = _progress_v11(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
             )
-            next_progress, next_stage, _ = self._compute_v10_progress_with_state(
-                qpos=next_qpos_data[i], qvel=next_qvel, ob=next_ob_i, prev_subtask=prev_subtask
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next = _progress_v11(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
             )
 
             shaping = shaping_coef * (discount * next_progress - prev_progress)
             stage_penalty = self._stage_penalty_from_stage(
                 stage=next_stage,
                 num_cubes=self.num_cubes,
-                num_substages=3,
+                num_substages=4,
             )
             event = self._v8_release_event(
                 prev_qpos=qpos_data[i],
@@ -1003,6 +1772,538 @@ class DenseRewardWrapper:
                 curr_ob=next_ob_i,
             )
             out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+        return out
+
+    def compute_v12_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v12")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+        lower_entry_xy_dist_state: Optional[float] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v12(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+                lower_entry_xy_dist=lower_entry_xy_dist_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next, lower_entry_xy_next = _progress_v12(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+                lower_entry_xy_dist=lower_entry_xy_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            event = self._v8_release_event(
+                prev_qpos=qpos_data[i],
+                curr_qpos=next_qpos_data[i],
+                prev_ob=prev_ob_i,
+                curr_ob=next_ob_i,
+            )
+            out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            lower_entry_xy_dist_state = lower_entry_xy_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+                lower_entry_xy_dist_state = None
+        return out
+
+    def compute_v13_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v13")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev = _progress_v11(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next = _progress_v11(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            # transition_event = self._v13_subtask_transition_event(
+            #     prev_subtask=prev_subtask_resolved,
+            #     next_subtask=next_subtask,
+            # )
+            out[i] = stage_penalty + shaping + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+        return out
+
+    def compute_v15_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v15")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+        lower_entry_xy_dist_state: Optional[float] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v15(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+                lower_entry_xy_dist=lower_entry_xy_dist_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next, lower_entry_xy_next = _progress_v15(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+                lower_entry_xy_dist=lower_entry_xy_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            event = self._v8_release_event(
+                prev_qpos=qpos_data[i],
+                curr_qpos=next_qpos_data[i],
+                prev_ob=prev_ob_i,
+                curr_ob=next_ob_i,
+            )
+            out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            lower_entry_xy_dist_state = lower_entry_xy_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+                lower_entry_xy_dist_state = None
+        return out
+
+    def compute_v16_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v16")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+        lower_entry_xy_dist_state: Optional[float] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v15(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+                lower_entry_xy_dist=lower_entry_xy_dist_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next, lower_entry_xy_next = _progress_v15(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+                lower_entry_xy_dist=lower_entry_xy_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            out[i] = stage_penalty + shaping + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            lower_entry_xy_dist_state = lower_entry_xy_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+                lower_entry_xy_dist_state = None
+        return out
+
+    def compute_v17_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v17")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+        lower_entry_xy_dist_state: Optional[float] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v15(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+                lower_entry_xy_dist=lower_entry_xy_dist_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next, lower_entry_xy_next = _progress_v15(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+                lower_entry_xy_dist=lower_entry_xy_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            transition_event = self._v13_subtask_transition_event(
+                prev_subtask=prev_subtask_resolved,
+                next_subtask=next_subtask,
+            )
+            out[i] = stage_penalty + shaping + transition_event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            lower_entry_xy_dist_state = lower_entry_xy_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+                lower_entry_xy_dist_state = None
+        return out
+
+    def compute_v18_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v18")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+        lower_entry_xy_dist_state: Optional[float] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+                lower_entry_xy_dist=lower_entry_xy_dist_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next, lower_entry_xy_next = _progress_v18(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+                lower_entry_xy_dist=lower_entry_xy_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            event = self._v8_release_event(
+                prev_qpos=qpos_data[i],
+                curr_qpos=next_qpos_data[i],
+                prev_ob=prev_ob_i,
+                curr_ob=next_ob_i,
+            )
+            out[i] = stage_penalty + shaping + event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            lower_entry_xy_dist_state = lower_entry_xy_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+                lower_entry_xy_dist_state = None
+        return out
+
+    def compute_v14_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v14")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+
+            prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev = _progress_v11(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next = _progress_v11(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            )
+
+            shaping = shaping_coef * (discount * next_progress - prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            transition_event = self._v13_subtask_transition_event(
+                prev_subtask=prev_subtask_resolved,
+                next_subtask=next_subtask,
+            )
+            out[i] = stage_penalty + shaping + transition_event + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
         return out
 
     def compute_dataset_rewards(
@@ -1051,6 +2352,62 @@ class DenseRewardWrapper:
                 )
             if self.version == 'v10':
                 return self.compute_v10_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v11':
+                return self.compute_v11_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v12':
+                return self.compute_v12_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v13':
+                return self.compute_v13_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v14':
+                return self.compute_v14_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v15':
+                return self.compute_v15_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v16':
+                return self.compute_v16_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v17':
+                return self.compute_v17_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v18':
+                return self.compute_v18_dataset_rewards(
                     ds,
                     discount=discount,
                     terminal_bonus=terminal_bonus,
@@ -1212,20 +2569,388 @@ class DenseRewardWrapper:
         shaping_coef: float = 1.0,
         **_,
     ) -> float:
-        prev_qvel = None
-        curr_qvel = None
-        prev_subtask = self._v10_prev_subtask
-
-        prev_progress, _, prev_subtask_resolved = self._compute_v10_progress_with_state(
-            qpos=prev_qpos, qvel=prev_qvel, ob=prev_ob, prev_subtask=prev_subtask
-        )
-        curr_progress, curr_stage, curr_subtask = self._compute_v10_progress_with_state(
-            qpos=curr_qpos, qvel=curr_qvel, ob=curr_ob, prev_subtask=prev_subtask_resolved
-        )
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+        prev_progress, _ = self.compute_progress(prev_qpos, gripper_pos=prev_gp)
+        curr_progress, _ = self.compute_progress(curr_qpos, gripper_pos=curr_gp)
         shaping = shaping_coef * (discount * curr_progress - prev_progress)
-        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=3)
+        stage_penalty = self._v7_v8_stage_penalty(qpos=curr_qpos, ob=curr_ob)
         event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
-        self._v10_prev_subtask = curr_subtask
+        return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v11_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev = _progress_v11(
+            prev_env,
+            prev_subtask=self._v11_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v11_lower_entry_z,
+            lower_entry_cube_idx=self._v11_lower_entry_cube_idx,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr = _progress_v11(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+
+        self._v11_prev_subtask = curr_subtask
+        self._v11_lower_entry_z = lower_entry_z_curr
+        self._v11_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v12_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v12(
+            prev_env,
+            prev_subtask=self._v12_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v12_lower_entry_z,
+            lower_entry_cube_idx=self._v12_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v12_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v12(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+
+        self._v12_prev_subtask = curr_subtask
+        self._v12_lower_entry_z = lower_entry_z_curr
+        self._v12_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v12_lower_entry_xy_dist = lower_entry_xy_curr
+        return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v13_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev = _progress_v11(
+            prev_env,
+            prev_subtask=self._v13_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v13_lower_entry_z,
+            lower_entry_cube_idx=self._v13_lower_entry_cube_idx,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr = _progress_v11(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        # transition_event = self._v13_subtask_transition_event(
+        #     prev_subtask=prev_subtask_resolved,
+        #     next_subtask=curr_subtask,
+        # )
+
+        self._v13_prev_subtask = curr_subtask
+        self._v13_lower_entry_z = lower_entry_z_curr
+        self._v13_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        return float(stage_penalty + shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v14_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev = _progress_v11(
+            prev_env,
+            prev_subtask=self._v14_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v14_lower_entry_z,
+            lower_entry_cube_idx=self._v14_lower_entry_cube_idx,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr = _progress_v11(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        transition_event = self._v13_subtask_transition_event(
+            prev_subtask=prev_subtask_resolved,
+            next_subtask=curr_subtask,
+        )
+
+        self._v14_prev_subtask = curr_subtask
+        self._v14_lower_entry_z = lower_entry_z_curr
+        self._v14_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        return float(stage_penalty + shaping + transition_event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v15_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v15(
+            prev_env,
+            prev_subtask=self._v15_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v15_lower_entry_z,
+            lower_entry_cube_idx=self._v15_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v15_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v15(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+
+        self._v15_prev_subtask = curr_subtask
+        self._v15_lower_entry_z = lower_entry_z_curr
+        self._v15_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v15_lower_entry_xy_dist = lower_entry_xy_curr
+        return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v16_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v15(
+            prev_env,
+            prev_subtask=self._v16_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v16_lower_entry_z,
+            lower_entry_cube_idx=self._v16_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v16_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v15(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+
+        self._v16_prev_subtask = curr_subtask
+        self._v16_lower_entry_z = lower_entry_z_curr
+        self._v16_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v16_lower_entry_xy_dist = lower_entry_xy_curr
+        return float(stage_penalty + shaping + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v17_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v15(
+            prev_env,
+            prev_subtask=self._v17_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v17_lower_entry_z,
+            lower_entry_cube_idx=self._v17_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v17_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v15(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        transition_event = self._v13_subtask_transition_event(
+            prev_subtask=prev_subtask_resolved,
+            next_subtask=curr_subtask,
+        )
+
+        self._v17_prev_subtask = curr_subtask
+        self._v17_lower_entry_z = lower_entry_z_curr
+        self._v17_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v17_lower_entry_xy_dist = lower_entry_xy_curr
+        return float(stage_penalty + shaping + transition_event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
+
+    def compute_v18_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        prev_env = self._make_env()
+        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp)
+        curr_env = self._make_env()
+        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp)
+
+        prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
+            prev_env,
+            prev_subtask=self._v18_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v18_lower_entry_z,
+            lower_entry_cube_idx=self._v18_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v18_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v18(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+
+        shaping = shaping_coef * (discount * curr_progress - prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        event = self._v8_release_event(prev_qpos=prev_qpos, curr_qpos=curr_qpos, prev_ob=prev_ob, curr_ob=curr_ob)
+
+        self._v18_prev_subtask = curr_subtask
+        self._v18_lower_entry_z = lower_entry_z_curr
+        self._v18_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v18_lower_entry_xy_dist = lower_entry_xy_curr
         return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
     def compute_online_reward(
@@ -1330,6 +3055,94 @@ class DenseRewardWrapper:
             )
         if self.version == 'v10':
             return self.compute_v10_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v11':
+            return self.compute_v11_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v12':
+            return self.compute_v12_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v13':
+            return self.compute_v13_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v14':
+            return self.compute_v14_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v15':
+            return self.compute_v15_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v16':
+            return self.compute_v16_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v17':
+            return self.compute_v17_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v18':
+            return self.compute_v18_online_reward(
                 prev_qpos=prev_qpos,
                 curr_qpos=curr_qpos,
                 env_reward=env_reward,
