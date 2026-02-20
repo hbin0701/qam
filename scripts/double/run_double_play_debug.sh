@@ -21,7 +21,7 @@ export MUJOCO_EGL_DEVICE_ID=0
 
 # Create directories
 mkdir -p logs/debug
-DATASET_DIR="/rlwrld3/home/hyeonbin/.ogbench/data/cube-double-play-1m"
+DATASET_DIR="/home/hyeonbin/RL/data/data/cube-double-play-1m"
 mkdir -p $DATASET_DIR
 
 # Download 1 shard (1M transitions) if not already present
