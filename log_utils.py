@@ -311,15 +311,24 @@ def _make_reward_plot_frame(rewards, cursor_step, height, width):
         x = left + int(round(xv * (plot_w / max(1, n - 1))))
         _draw_line(canvas, x, top, x, top + plot_h, tick_color)
 
-    # Reward curve.
-    curve_color = np.array([34, 119, 217], dtype=np.uint8)
+    # Reward curve: color by sign on a single graph.
+    pos_color = np.array([34, 119, 217], dtype=np.uint8)   # blue: positive reward
+    neg_color = np.array([220, 68, 55], dtype=np.uint8)    # red: negative reward
+    zero_color = np.array([120, 130, 140], dtype=np.uint8) # gray: near zero / crossing
     xs = left + np.round(np.arange(n) * (plot_w / max(1, n - 1))).astype(np.int32)
     ys = top + np.round((1.0 - (r - r_min) / (r_max - r_min)) * plot_h).astype(np.int32)
     ys = np.clip(ys, top, top + plot_h)
     for i in range(1, n):
+        r0, r1 = float(r[i - 1]), float(r[i])
+        if r0 > 0.0 and r1 > 0.0:
+            seg_color = pos_color
+        elif r0 < 0.0 and r1 < 0.0:
+            seg_color = neg_color
+        else:
+            seg_color = zero_color
         # Slightly thicker line for readability in video.
-        _draw_line(canvas, xs[i - 1], ys[i - 1] + 1, xs[i], ys[i] + 1, curve_color)
-        _draw_line(canvas, xs[i - 1], ys[i - 1], xs[i], ys[i], curve_color)
+        _draw_line(canvas, xs[i - 1], ys[i - 1] + 1, xs[i], ys[i] + 1, seg_color)
+        _draw_line(canvas, xs[i - 1], ys[i - 1], xs[i], ys[i], seg_color)
 
     # Moving cursor.
     cursor_step = int(np.clip(cursor_step, 0, n - 1))
@@ -583,6 +592,41 @@ def get_wandb_video_with_lift_progress(
             lift_plot = _make_metric_plot_frame(cube_lift, step_idx, top_h, frame.shape[1], "cube_lift")
             grip_plot = _make_metric_plot_frame(gripper_metric, step_idx, bottom_h, frame.shape[1], metric_name)
             panel = np.concatenate([lift_plot, grip_plot], axis=0)
+            episode_frames.append(np.concatenate([frame, panel], axis=1))
+        composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
+
+    if len(composite_renders) == 0:
+        return None
+    return get_wandb_video(composite_renders, n_cols=n_cols, fps=fps)
+
+
+def get_wandb_video_with_gripper_cube_dists(
+    renders,
+    left_dist_traces,
+    right_dist_traces,
+    frame_steps,
+    n_cols=None,
+    fps=15,
+):
+    """Return a W&B video with frames + synchronized left/right gripper-cube distance plots."""
+    if renders is None or len(renders) == 0:
+        return None
+
+    composite_renders = []
+    for i, render in enumerate(renders):
+        if len(render) == 0:
+            continue
+        left_dist = left_dist_traces[i] if i < len(left_dist_traces) else np.zeros((1,), dtype=np.float32)
+        right_dist = right_dist_traces[i] if i < len(right_dist_traces) else np.zeros((1,), dtype=np.float32)
+        steps = frame_steps[i] if i < len(frame_steps) else np.arange(len(render), dtype=np.int32)
+        episode_frames = []
+        for j, frame in enumerate(render):
+            step_idx = steps[j] if j < len(steps) else (len(left_dist) - 1)
+            top_h = frame.shape[0] // 2
+            bottom_h = frame.shape[0] - top_h
+            left_plot = _make_metric_plot_frame(left_dist, step_idx, top_h, frame.shape[1], "left_gripper_cube_dist")
+            right_plot = _make_metric_plot_frame(right_dist, step_idx, bottom_h, frame.shape[1], "right_gripper_cube_dist")
+            panel = np.concatenate([left_plot, right_plot], axis=0)
             episode_frames.append(np.concatenate([frame, panel], axis=1))
         composite_renders.append(np.asarray(episode_frames, dtype=np.uint8))
 

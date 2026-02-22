@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run QAM-EDIT on Single-Play Task 2 with DENSE V1 reward (ONLINE-ONLY)
+# Run QAM-EDIT on Single-Play Task 2 with DENSE V22 reward (ONLINE-ONLY)
 
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.20
@@ -10,10 +10,10 @@ export PYTHONPATH="/rlwrld3/home/hyeonbin/RL/ogbench:${PYTHONPATH:-}"
 
 MUJOCO_GL=egl python main.py \
     --run_group=single_task2_rewards_online \
-    --project=0219-single-tmp1-re \
-    --run_name=0220_qam_v1_random \
+    --project=0219-single-tmp1 \
+    --run_name=0220_qam_v22_random_final \
     --agent=agents/qam.py \
-    --tags=QAM_EDIT,dense_v1,single,online \
+    --tags=QAM_EDIT,dense_v22,single,online \
     --seed=10001 \
     --env_name=cube-single-play-singletask-task2-v0 \
     --cube_success_threshold=0.02 \
@@ -21,7 +21,7 @@ MUJOCO_GL=egl python main.py \
     --randomize_task_init_cube_pos=True \
     --ogbench_dataset_dir=/rlwrld3/home/hyeonbin/.ogbench/data/cube-single-play-1m \
     --sparse=False \
-    --dense_reward_version=v1 \
+    --dense_reward_version=v22 \
     --terminal_bonus=20 \
     --dense_shaping_lambda=20 \
     --horizon_length=5 \
@@ -33,6 +33,6 @@ MUJOCO_GL=egl python main.py \
     --online_steps=50000 \
     --start_training=1 \
     --eval_interval=5000 \
-    --log_interval=5000 \
+    --log_interval=1000 \
     --dataset_replace_interval=0 \
     --video_episodes=1

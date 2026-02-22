@@ -36,6 +36,11 @@ Reward versions:
 - v18: v15 + latched lower-entry-Z per active cube (first stage-3 entry only).
 - v20: v18 semantics with gripper-closure driven by physical left/right
        fingertip gap (meters) when available.
+- v21: v18 semantics with the same physical gripper-gap and strict grasp
+       checks as v20.
+- v22: v21 semantics + monotonic stage/progress shaping (no reward for
+       re-achieving previously reached stages/progress after regressions).
+- v23: v22 + small per-step time penalty.
 """
 
 import re
@@ -81,9 +86,14 @@ V8_RELEASE_SUCCESS_BONUS = 0.5
 V8_RELEASE_FAR_PENALTY = 0.25
 V13_SUBTASK_TRANSITION_BONUS = 5.0
 # v20 gripper-gap normalization (meters):
-# close_score = clip((OPEN_REF - gap) / (OPEN_REF - CLOSED_REF), 0, 1)
-V20_GRIPPER_GAP_OPEN_REF = 0.10
-V20_GRIPPER_GAP_CLOSED_REF = 0.02
+# close_score = clip((open_ref - gap) / (open_ref - close_ref), 0, 1)
+# with open_ref = max(initial_gap, 0.1) and close_ref fixed at 0.05.
+V20_GRIPPER_GAP_OPEN_FLOOR = 0.10
+V20_GRIPPER_GAP_CLOSE_REF = 0.055
+V20_PAD_CUBE_DIST_THRESHOLD = 0.045
+V20_PAD_CUBE_AVG_DIST_THRESHOLD = 0.04
+V21_REACH_PAD_CUBE_DIST_THRESHOLD = 0.07
+V23_STEP_PENALTY = 1.0
 
 
 def compute_cube_order(init_positions: np.ndarray, reference: np.ndarray = GRIPPER_HOME) -> List[int]:
@@ -104,10 +114,10 @@ def extract_gripper_pos(obs: np.ndarray) -> np.ndarray:
     return obs[12:15] / OBS_XYZ_SCALER + OBS_XYZ_CENTER
 
 
-def gripper_close_from_gap(gripper_gap_m: float) -> float:
+def gripper_close_from_gap(gripper_gap_m: float, open_ref: float, close_ref: float = V20_GRIPPER_GAP_CLOSE_REF) -> float:
     """Map physical finger gap in meters to a close score in [0, 1]."""
-    denom = max(V20_GRIPPER_GAP_OPEN_REF - V20_GRIPPER_GAP_CLOSED_REF, 1e-6)
-    return float(np.clip((V20_GRIPPER_GAP_OPEN_REF - gripper_gap_m) / denom, 0.0, 1.0))
+    denom = max(open_ref - close_ref, 1e-6)
+    return float(np.clip((open_ref - gripper_gap_m) / denom, 0.0, 1.0))
 
 
 def extract_gripper_gap_from_sim(env_unwrapped) -> Optional[float]:
@@ -171,6 +181,64 @@ def extract_gripper_gap_from_sim(env_unwrapped) -> Optional[float]:
         return float(np.linalg.norm(left - right))
     except Exception:
         return None
+
+
+def extract_gripper_pad_positions_from_sim(env_unwrapped) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Best-effort extraction of left/right gripper pad world positions."""
+    model = getattr(env_unwrapped, "_model", None) or getattr(env_unwrapped, "model", None)
+    data = getattr(env_unwrapped, "_data", None) or getattr(env_unwrapped, "data", None)
+    if model is None or data is None:
+        return None, None
+
+    cache = getattr(env_unwrapped, "_qam_gripper_pad_pair", None)
+    if cache is None:
+        try:
+            import mujoco
+        except Exception:
+            return None, None
+
+        def _name2id(obj_type, name):
+            try:
+                return int(mujoco.mj_name2id(model, obj_type, name))
+            except Exception:
+                return -1
+
+        site_pairs = [
+            ("ur5e/robotiq/left_fingertip_site", "ur5e/robotiq/right_fingertip_site"),
+            ("ur5e/robotiq/left_fingertip", "ur5e/robotiq/right_fingertip"),
+            ("left_fingertip_site", "right_fingertip_site"),
+        ]
+        for left_name, right_name in site_pairs:
+            left_id = _name2id(mujoco.mjtObj.mjOBJ_SITE, left_name)
+            right_id = _name2id(mujoco.mjtObj.mjOBJ_SITE, right_name)
+            if left_id >= 0 and right_id >= 0:
+                cache = ("site", left_id, right_id)
+                break
+
+        if cache is None:
+            body_pairs = [
+                ("ur5e/robotiq/left_silicone_pad", "ur5e/robotiq/right_silicone_pad"),
+                ("ur5e/robotiq/left_pad", "ur5e/robotiq/right_pad"),
+            ]
+            for left_name, right_name in body_pairs:
+                left_id = _name2id(mujoco.mjtObj.mjOBJ_BODY, left_name)
+                right_id = _name2id(mujoco.mjtObj.mjOBJ_BODY, right_name)
+                if left_id >= 0 and right_id >= 0:
+                    cache = ("body", left_id, right_id)
+                    break
+
+        setattr(env_unwrapped, "_qam_gripper_pad_pair", cache)
+
+    if cache is None:
+        return None, None
+
+    kind, left_id, right_id = cache
+    try:
+        if kind == "site":
+            return data.site_xpos[left_id].copy(), data.site_xpos[right_id].copy()
+        return data.xpos[left_id].copy(), data.xpos[right_id].copy()
+    except Exception:
+        return None, None
 
 
 # ============================================================
@@ -310,11 +378,19 @@ class CubeEnvModel:
         # OGBench proxy in [0, 1]: 0=open, ~0.56=closed in these datasets.
         self.gripper_width: float = 0.0
         self.gripper_gap_m: Optional[float] = None
+        self.gripper_gap_open_ref_m: float = V20_GRIPPER_GAP_OPEN_FLOOR
+        self.left_gripper_pos: Optional[np.ndarray] = None
+        self.right_gripper_pos: Optional[np.ndarray] = None
         self.gripper_pos: Optional[np.ndarray] = None
+        self.use_pad_reach: bool = False
+        self.pad_reach_threshold: float = V21_REACH_PAD_CUBE_DIST_THRESHOLD
 
     def load_state(self, qpos: np.ndarray, qvel: np.ndarray = None,
                    gripper_pos: Optional[np.ndarray] = None,
-                   gripper_gap_m: Optional[float] = None):
+                   gripper_gap_m: Optional[float] = None,
+                   gripper_gap_open_ref_m: Optional[float] = None,
+                   left_gripper_pos: Optional[np.ndarray] = None,
+                   right_gripper_pos: Optional[np.ndarray] = None):
         """Load state from qpos vector.
 
         qpos layout: [arm_joints(6), gripper_joints(8), cube0_pos(3)+quat(4), cube1_pos(3)+quat(4), ...]
@@ -325,15 +401,31 @@ class CubeEnvModel:
             self.cubes[i].position = qpos[pos_start:pos_start + 3].copy()
         self.gripper_gap_m = None if gripper_gap_m is None else float(gripper_gap_m)
         if gripper_gap_m is not None:
-            self.gripper_width = gripper_close_from_gap(float(gripper_gap_m))
+            if gripper_gap_open_ref_m is None:
+                gripper_gap_open_ref_m = V20_GRIPPER_GAP_OPEN_FLOOR
+            self.gripper_gap_open_ref_m = float(max(gripper_gap_open_ref_m, V20_GRIPPER_GAP_OPEN_FLOOR))
+            self.gripper_width = gripper_close_from_gap(float(gripper_gap_m), open_ref=self.gripper_gap_open_ref_m)
         else:
             self.gripper_width = float(np.clip(qpos[6] / 0.8, 0.0, 1.0))
+            self.gripper_gap_open_ref_m = V20_GRIPPER_GAP_OPEN_FLOOR
         if gripper_pos is not None:
             self.gripper_pos = gripper_pos.copy()
+        self.left_gripper_pos = left_gripper_pos.copy() if left_gripper_pos is not None else None
+        self.right_gripper_pos = right_gripper_pos.copy() if right_gripper_pos is not None else None
 
     def is_grasped(self, cube_idx: int) -> bool:
         cube = self.cubes[cube_idx]
         gripper_closed = self.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD
+        if self.gripper_gap_m is not None and self.left_gripper_pos is not None and self.right_gripper_pos is not None:
+            left_dist = float(np.linalg.norm(self.left_gripper_pos - cube.position))
+            right_dist = float(np.linalg.norm(self.right_gripper_pos - cube.position))
+            avg_dist = 0.5 * (left_dist + right_dist)
+            gripper_closed = (
+                gripper_closed
+                and (left_dist <= V20_PAD_CUBE_DIST_THRESHOLD)
+                and (right_dist <= V20_PAD_CUBE_DIST_THRESHOLD)
+                and (avg_dist <= V20_PAD_CUBE_AVG_DIST_THRESHOLD)
+            )
         is_lifted = cube.position[2] > cube.initial_position[2] + 0.01
         return gripper_closed and is_lifted
 
@@ -466,7 +558,7 @@ def progress_v6(env: CubeEnvModel) -> Tuple[float, int]:
     # Open-progress proxy for release stage: 1=open, 0=closed.
     gripper_open = float(np.clip((V6_GRIPPER_CLOSED_REF - env.gripper_width) / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
     # Use v6-specific grasp condition consistent with OGBench opening proxy.
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
@@ -531,7 +623,7 @@ def progress_v7(env: CubeEnvModel) -> Tuple[float, int]:
     cube = env.cubes[active_idx]
     cube_goal_dist = cube.distance_to_goal()
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
@@ -686,7 +778,7 @@ def _progress_v10(
     cube = env.cubes[active_idx]
     cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
@@ -753,13 +845,14 @@ def _progress_v11(
     cube = env.cubes[active_idx]
     cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
         gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+    reached_for_grasp = _is_reached_for_grasp(env, active_idx, gripper_dist)
 
-    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+    if (not grasped) and (not reached_for_grasp):
         subtask_idx = 0
     elif not grasped:
         subtask_idx = 1
@@ -847,13 +940,14 @@ def _progress_v12(
     cube = env.cubes[active_idx]
     cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
         gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+    reached_for_grasp = _is_reached_for_grasp(env, active_idx, gripper_dist)
 
-    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+    if (not grasped) and (not reached_for_grasp):
         subtask_idx = 0
     elif not grasped:
         subtask_idx = 1
@@ -951,7 +1045,7 @@ def _progress_v15(
     cube = env.cubes[active_idx]
     cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
@@ -1068,13 +1162,14 @@ def _progress_v18(
     cube = env.cubes[active_idx]
     cube_goal_xy_dist = float(np.linalg.norm(cube.position[:2] - cube.goal_position[:2]))
     cube_lift = float(cube.position[2] - cube.initial_position[2])
-    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > V6_GRASP_LIFT_THRESHOLD)
+    grasped = _is_grasped_strict(env, active_idx, cube_lift)
 
     gripper_dist = None
     if env.gripper_pos is not None:
         gripper_dist = float(np.linalg.norm(env.gripper_pos - cube.position))
+    reached_for_grasp = _is_reached_for_grasp(env, active_idx, gripper_dist)
 
-    if (not grasped) and (gripper_dist is not None) and (gripper_dist > V6_REACH_THRESHOLD):
+    if (not grasped) and (not reached_for_grasp):
         subtask_idx = 0
     elif not grasped:
         subtask_idx = 1
@@ -1090,8 +1185,12 @@ def _progress_v18(
         subprogress = float(np.clip(1.0 - (cur_reach_dist / init_reach_dist), 0.0, 1.0))
     elif subtask_idx == 1:
         lift_progress = float(np.clip(cube_lift / V6_GRASP_LIFT_TARGET, 0.0, 1.0))
-        close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
-        subprogress = 0.6 * lift_progress + 0.4 * close_progress
+        if env.use_pad_reach:
+            # v21: remove gripper-closure component from grasp-stage subprogress.
+            subprogress = lift_progress
+        else:
+            close_progress = float(np.clip(env.gripper_width / V6_GRIPPER_CLOSED_REF, 0.0, 1.0))
+            subprogress = 0.6 * lift_progress + 0.4 * close_progress
     elif subtask_idx == 2:
         init_goal_xy_dist = float(np.linalg.norm(cube.initial_position[:2] - cube.goal_position[:2]))
         effective_current = max(cube_goal_xy_dist - env.success_threshold, 0.0)
@@ -1161,6 +1260,41 @@ def _v10_grasp_subprogress(env: CubeEnvModel, cube_lift: float) -> float:
     return 0.6 * lift_progress + 0.4 * close_progress
 
 
+def _is_grasped_strict(env: CubeEnvModel, cube_idx: int, cube_lift: float) -> bool:
+    """Base grasp test with stricter v20 pad-to-cube distance checks."""
+    lift_threshold = V6_GRASP_LIFT_TARGET if env.use_pad_reach else V6_GRASP_LIFT_THRESHOLD
+    grasped = (env.gripper_width >= V6_GRIPPER_CLOSED_THRESHOLD) and (cube_lift > lift_threshold)
+    if not grasped:
+        return False
+    if env.gripper_gap_m is None:
+        return True
+    if env.left_gripper_pos is None or env.right_gripper_pos is None:
+        return True
+    cube = env.cubes[cube_idx]
+    left_dist = float(np.linalg.norm(env.left_gripper_pos - cube.position))
+    right_dist = float(np.linalg.norm(env.right_gripper_pos - cube.position))
+    avg_dist = 0.5 * (left_dist + right_dist)
+    return (
+        (left_dist <= V20_PAD_CUBE_DIST_THRESHOLD)
+        and (right_dist <= V20_PAD_CUBE_DIST_THRESHOLD)
+        and (avg_dist <= V20_PAD_CUBE_AVG_DIST_THRESHOLD)
+    )
+
+
+def _is_reached_for_grasp(env: CubeEnvModel, cube_idx: int, gripper_dist: Optional[float]) -> bool:
+    """Reach condition: for v21 use bilateral pad-to-cube thresholds, else fall back."""
+    if env.use_pad_reach:
+        if env.left_gripper_pos is None or env.right_gripper_pos is None:
+            return False
+        cube = env.cubes[cube_idx]
+        left_dist = float(np.linalg.norm(env.left_gripper_pos - cube.position))
+        right_dist = float(np.linalg.norm(env.right_gripper_pos - cube.position))
+        return (left_dist <= env.pad_reach_threshold) and (right_dist <= env.pad_reach_threshold)
+    if gripper_dist is None:
+        return False
+    return gripper_dist <= V6_REACH_THRESHOLD
+
+
 # ============================================================
 # Unified DenseRewardWrapper
 # ============================================================
@@ -1182,6 +1316,9 @@ PROGRESS_FNS = {
     'v17': progress_v17,
     'v18': progress_v18,
     'v20': progress_v18,
+    'v21': progress_v18,
+    'v22': progress_v18,
+    'v23': progress_v18,
     'v13': progress_v13,
     'v14': progress_v14,
 }
@@ -1206,11 +1343,13 @@ class DenseRewardWrapper:
         version: str = "v2",
         debug: bool = False,
         success_threshold: float = CUBE_SUCCESS_THRESHOLD,
+        v23_step_penalty: float = V23_STEP_PENALTY,
     ):
         self.task_name = task_name
         self.version = version
         self.debug = debug
         self.success_threshold = success_threshold
+        self.v23_step_penalty = float(v23_step_penalty)
 
         # Auto-detect from env_name
         self.env_type, self.task_id, self.num_cubes = parse_env_name(task_name)
@@ -1261,6 +1400,14 @@ class DenseRewardWrapper:
         self._v20_lower_entry_z: Optional[float] = None
         self._v20_lower_entry_cube_idx: Optional[int] = None
         self._v20_lower_entry_xy_dist: Optional[float] = None
+        self._v20_gap_open_ref_m: float = V20_GRIPPER_GAP_OPEN_FLOOR
+        self._v22_prev_subtask: Optional[int] = None
+        self._v22_lower_entry_z: Optional[float] = None
+        self._v22_lower_entry_cube_idx: Optional[int] = None
+        self._v22_lower_entry_xy_dist: Optional[float] = None
+        self._v22_gap_open_ref_m: float = V20_GRIPPER_GAP_OPEN_FLOOR
+        self._v22_best_progress: Optional[float] = None
+        self._v22_best_stage: Optional[int] = None
 
         # Precompute cube ordering for v3/v5/v6: nearest cube to gripper home goes first
         if self.init_positions is not None:
@@ -1268,8 +1415,8 @@ class DenseRewardWrapper:
         else:
             self.cube_order = list(range(self.num_cubes))
 
-        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'):
-            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'")
+        if version not in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20', 'v21', 'v22', 'v23'):
+            raise ValueError(f"Unknown version: {version}. Choose from 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20', 'v21', 'v22', 'v23'")
 
         if debug:
             print(f"[DenseReward-{version}] env_type={self.env_type}, task_id={self.task_id}, "
@@ -1280,20 +1427,31 @@ class DenseRewardWrapper:
     @property
     def max_progress(self) -> float:
         """Maximum raw progress value for this version."""
-        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'):
+        if self.version in ('v3', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20', 'v21', 'v22', 'v23'):
             return float(self.num_cubes)
         return float(self.num_cubes)
 
     def compute_potential(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
                           gripper_pos: Optional[np.ndarray] = None,
-                          gripper_gap_m: Optional[float] = None) -> float:
+                          gripper_gap_m: Optional[float] = None,
+                          gripper_gap_open_ref_m: Optional[float] = None,
+                          left_gripper_pos: Optional[np.ndarray] = None,
+                          right_gripper_pos: Optional[np.ndarray] = None) -> float:
         """Compute shaping potential/value from progress.
 
         - v2/v3 use raw progress P_v2(s)/P_v3(s), range [0, num_cubes].
         - other versions keep centered form, range [-num_cubes, 0].
         """
-        progress, _ = self.compute_progress(qpos, qvel, gripper_pos, gripper_gap_m=gripper_gap_m)
-        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20'):
+        progress, _ = self.compute_progress(
+            qpos,
+            qvel,
+            gripper_pos,
+            gripper_gap_m=gripper_gap_m,
+            gripper_gap_open_ref_m=gripper_gap_open_ref_m,
+            left_gripper_pos=left_gripper_pos,
+            right_gripper_pos=right_gripper_pos,
+        )
+        if self.version in ('v2', 'v3', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v20', 'v21', 'v22', 'v23'):
             return float(progress)
         scale = self.num_cubes / self.max_progress
         return float(progress * scale - self.num_cubes)
@@ -1350,6 +1508,36 @@ class DenseRewardWrapper:
         self._v20_lower_entry_z = None
         self._v20_lower_entry_cube_idx = None
         self._v20_lower_entry_xy_dist = None
+        self._v20_gap_open_ref_m = V20_GRIPPER_GAP_OPEN_FLOOR
+        self._v22_prev_subtask = None
+        self._v22_lower_entry_z = None
+        self._v22_lower_entry_cube_idx = None
+        self._v22_lower_entry_xy_dist = None
+        self._v22_gap_open_ref_m = V20_GRIPPER_GAP_OPEN_FLOOR
+        self._v22_best_progress = None
+        self._v22_best_stage = None
+
+    @staticmethod
+    def _monotonic_progress_stage(
+        prev_progress: float,
+        curr_progress: float,
+        prev_stage: int,
+        curr_stage: int,
+        best_progress: Optional[float],
+        best_stage: Optional[int],
+    ) -> Tuple[float, float, int, float, int]:
+        """Compute monotonicized progress/stage for anti-cycling shaping."""
+        effective_prev_progress = max(float(prev_progress), float(best_progress) if best_progress is not None else float(prev_progress))
+        effective_curr_progress = max(effective_prev_progress, float(curr_progress))
+        effective_prev_stage = max(int(prev_stage), int(best_stage) if best_stage is not None else int(prev_stage))
+        effective_curr_stage = max(effective_prev_stage, int(curr_stage))
+        return (
+            effective_prev_progress,
+            effective_curr_progress,
+            effective_curr_stage,
+            effective_curr_progress,
+            effective_curr_stage,
+        )
 
     @staticmethod
     def _stage_penalty_from_stage(stage: int, num_cubes: int, num_substages: int = 3) -> float:
@@ -1438,10 +1626,23 @@ class DenseRewardWrapper:
 
     def compute_progress(self, qpos: np.ndarray, qvel: Optional[np.ndarray] = None,
                          gripper_pos: Optional[np.ndarray] = None,
-                         gripper_gap_m: Optional[float] = None) -> Tuple[float, int]:
+                         gripper_gap_m: Optional[float] = None,
+                         gripper_gap_open_ref_m: Optional[float] = None,
+                         left_gripper_pos: Optional[np.ndarray] = None,
+                         right_gripper_pos: Optional[np.ndarray] = None) -> Tuple[float, int]:
         """Compute progress for a single state."""
         env = self._make_env()
-        env.load_state(qpos, qvel, gripper_pos, gripper_gap_m=gripper_gap_m)
+        env.load_state(
+            qpos,
+            qvel,
+            gripper_pos,
+            gripper_gap_m=gripper_gap_m,
+            gripper_gap_open_ref_m=gripper_gap_open_ref_m,
+            left_gripper_pos=left_gripper_pos,
+            right_gripper_pos=right_gripper_pos,
+        )
+        env.use_pad_reach = self.version in ("v21", "v22", "v23")
+        env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
         return PROGRESS_FNS[self.version](env)
 
     def compute_progress_for_logging(
@@ -1449,11 +1650,24 @@ class DenseRewardWrapper:
         qpos: np.ndarray,
         ob: Optional[np.ndarray] = None,
         gripper_gap_m: Optional[float] = None,
+        gripper_gap_open_ref_m: Optional[float] = None,
+        left_gripper_pos: Optional[np.ndarray] = None,
+        right_gripper_pos: Optional[np.ndarray] = None,
     ) -> Tuple[float, int]:
         """Progress for visualization using current internal state (for stateful versions)."""
         gp = extract_gripper_pos(ob) if ob is not None else None
         env = self._make_env()
-        env.load_state(qpos, qvel=None, gripper_pos=gp, gripper_gap_m=gripper_gap_m)
+        env.load_state(
+            qpos,
+            qvel=None,
+            gripper_pos=gp,
+            gripper_gap_m=gripper_gap_m,
+            gripper_gap_open_ref_m=gripper_gap_open_ref_m,
+            left_gripper_pos=left_gripper_pos,
+            right_gripper_pos=right_gripper_pos,
+        )
+        env.use_pad_reach = self.version in ("v21", "v22", "v23")
+        env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
 
         if self.version == 'v11':
             p, s, _, _, _ = _progress_v11(
@@ -1532,7 +1746,7 @@ class DenseRewardWrapper:
                 lower_entry_xy_dist=self._v18_lower_entry_xy_dist,
             )
             return float(p), int(s)
-        if self.version == 'v20':
+        if self.version in ('v20', 'v21'):
             p, s, _, _, _, _ = _progress_v18(
                 env,
                 prev_subtask=self._v20_prev_subtask,
@@ -1542,8 +1756,26 @@ class DenseRewardWrapper:
                 lower_entry_xy_dist=self._v20_lower_entry_xy_dist,
             )
             return float(p), int(s)
+        if self.version in ('v22', 'v23'):
+            p, s, _, _, _, _ = _progress_v18(
+                env,
+                prev_subtask=self._v22_prev_subtask,
+                prev_env=None,
+                lower_entry_z=self._v22_lower_entry_z,
+                lower_entry_cube_idx=self._v22_lower_entry_cube_idx,
+                lower_entry_xy_dist=self._v22_lower_entry_xy_dist,
+            )
+            return float(p), int(s)
 
-        return self.compute_progress(qpos, qvel=None, gripper_pos=gp, gripper_gap_m=gripper_gap_m)
+        return self.compute_progress(
+            qpos,
+            qvel=None,
+            gripper_pos=gp,
+            gripper_gap_m=gripper_gap_m,
+            gripper_gap_open_ref_m=gripper_gap_open_ref_m,
+            left_gripper_pos=left_gripper_pos,
+            right_gripper_pos=right_gripper_pos,
+        )
 
     def _require_keys(self, ds: Dict[str, np.ndarray], keys: List[str], ctx: str):
         missing = [k for k in keys if k not in ds]
@@ -2293,8 +2525,12 @@ class DenseRewardWrapper:
 
             prev_env = self._make_env()
             prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            prev_env.use_pad_reach = self.version in ("v21", "v22", "v23")
+            prev_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
             next_env = self._make_env()
             next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+            next_env.use_pad_reach = self.version in ("v21", "v22", "v23")
+            next_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
 
             prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
                 prev_env,
@@ -2351,6 +2587,118 @@ class DenseRewardWrapper:
             discount=discount,
             terminal_bonus=terminal_bonus,
             shaping_coef=shaping_coef,
+        )
+
+    def compute_v22_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        step_penalty: float = 0.0,
+    ) -> np.ndarray:
+        """V22/V23 dataset rewards: v21 semantics with monotonic anti-cycling."""
+        self._require_keys(ds, ['qpos', 'next_qpos', 'rewards'], "v22")
+        qpos_data = ds['qpos']
+        qvel_data = ds.get('qvel', None)
+        next_qpos_data = ds['next_qpos']
+        next_qvel_data = ds.get('next_qvel', None)
+        obs_data = ds.get('observations', None)
+        next_obs_data = ds.get('next_observations', None)
+        terminals_data = ds.get('terminals', ds.get('dones', ds.get('dones_float', None)))
+
+        prev_subtask_state: Optional[int] = None
+        lower_entry_z_state: Optional[float] = None
+        lower_entry_cube_idx_state: Optional[int] = None
+        lower_entry_xy_dist_state: Optional[float] = None
+        best_progress_state: Optional[float] = None
+        best_stage_state: Optional[int] = None
+
+        out = np.zeros(len(qpos_data), dtype=np.float32)
+        for i in range(len(qpos_data)):
+            qvel = qvel_data[i] if qvel_data is not None else None
+            next_qvel = next_qvel_data[i] if next_qvel_data is not None else None
+            prev_ob_i = obs_data[i] if obs_data is not None else None
+            next_ob_i = next_obs_data[i] if next_obs_data is not None else None
+
+            prev_gp = extract_gripper_pos(prev_ob_i) if prev_ob_i is not None else None
+            next_gp = extract_gripper_pos(next_ob_i) if next_ob_i is not None else None
+
+            prev_env = self._make_env()
+            prev_env.load_state(qpos_data[i], qvel=qvel, gripper_pos=prev_gp)
+            prev_env.use_pad_reach = self.version in ("v21", "v22", "v23")
+            prev_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
+            next_env = self._make_env()
+            next_env.load_state(next_qpos_data[i], qvel=next_qvel, gripper_pos=next_gp)
+            next_env.use_pad_reach = self.version in ("v21", "v22", "v23")
+            next_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
+
+            prev_progress, prev_stage, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
+                prev_env,
+                prev_subtask=prev_subtask_state,
+                prev_env=None,
+                lower_entry_z=lower_entry_z_state,
+                lower_entry_cube_idx=lower_entry_cube_idx_state,
+                lower_entry_xy_dist=lower_entry_xy_dist_state,
+            )
+            next_progress, next_stage, next_subtask, lower_entry_z_next, lower_entry_cube_idx_next, lower_entry_xy_next = _progress_v18(
+                next_env,
+                prev_subtask=prev_subtask_resolved,
+                prev_env=prev_env,
+                lower_entry_z=lower_entry_z_prev,
+                lower_entry_cube_idx=lower_entry_cube_idx_prev,
+                lower_entry_xy_dist=lower_entry_xy_prev,
+            )
+            mono_prev_progress, mono_next_progress, mono_next_stage, best_progress_next, best_stage_next = self._monotonic_progress_stage(
+                prev_progress=prev_progress,
+                curr_progress=next_progress,
+                prev_stage=prev_stage,
+                curr_stage=next_stage,
+                best_progress=best_progress_state,
+                best_stage=best_stage_state,
+            )
+
+            shaping = shaping_coef * (discount * mono_next_progress - mono_prev_progress)
+            stage_penalty = self._stage_penalty_from_stage(
+                stage=mono_next_stage,
+                num_cubes=self.num_cubes,
+                num_substages=4,
+            )
+            out[i] = (
+                stage_penalty
+                + shaping
+                + self._success_bonus_post(next_qpos_data[i], next_qvel, terminal_bonus)
+                - float(step_penalty)
+            )
+
+            prev_subtask_state = next_subtask
+            lower_entry_z_state = lower_entry_z_next
+            lower_entry_cube_idx_state = lower_entry_cube_idx_next
+            lower_entry_xy_dist_state = lower_entry_xy_next
+            best_progress_state = best_progress_next
+            best_stage_state = best_stage_next
+            if terminals_data is not None and bool(terminals_data[i]):
+                prev_subtask_state = None
+                lower_entry_z_state = None
+                lower_entry_cube_idx_state = None
+                lower_entry_xy_dist_state = None
+                best_progress_state = None
+                best_stage_state = None
+        return out
+
+    def compute_v23_dataset_rewards(
+        self,
+        ds: Dict[str, np.ndarray],
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+    ) -> np.ndarray:
+        return self.compute_v22_dataset_rewards(
+            ds=ds,
+            discount=discount,
+            terminal_bonus=terminal_bonus,
+            shaping_coef=shaping_coef,
+            step_penalty=self.v23_step_penalty,
         )
 
     def compute_v14_dataset_rewards(
@@ -2531,8 +2879,22 @@ class DenseRewardWrapper:
                     terminal_bonus=terminal_bonus,
                     shaping_coef=shaping_coef,
                 )
-            if self.version == 'v20':
+            if self.version in ('v20', 'v21'):
                 return self.compute_v20_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v22':
+                return self.compute_v22_dataset_rewards(
+                    ds,
+                    discount=discount,
+                    terminal_bonus=terminal_bonus,
+                    shaping_coef=shaping_coef,
+                )
+            if self.version == 'v23':
+                return self.compute_v23_dataset_rewards(
                     ds,
                     discount=discount,
                     terminal_bonus=terminal_bonus,
@@ -3087,6 +3449,10 @@ class DenseRewardWrapper:
         curr_ob: Optional[np.ndarray] = None,
         prev_gripper_gap_m: Optional[float] = None,
         curr_gripper_gap_m: Optional[float] = None,
+        prev_left_gripper_pos: Optional[np.ndarray] = None,
+        prev_right_gripper_pos: Optional[np.ndarray] = None,
+        curr_left_gripper_pos: Optional[np.ndarray] = None,
+        curr_right_gripper_pos: Optional[np.ndarray] = None,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
         shaping_coef: float = 1.0,
@@ -3095,10 +3461,35 @@ class DenseRewardWrapper:
         prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
         curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
 
+        if prev_gripper_gap_m is not None:
+            self._v20_gap_open_ref_m = max(self._v20_gap_open_ref_m, float(prev_gripper_gap_m), V20_GRIPPER_GAP_OPEN_FLOOR)
+        elif curr_gripper_gap_m is not None:
+            self._v20_gap_open_ref_m = max(self._v20_gap_open_ref_m, float(curr_gripper_gap_m), V20_GRIPPER_GAP_OPEN_FLOOR)
+
         prev_env = self._make_env()
-        prev_env.load_state(prev_qpos, qvel=None, gripper_pos=prev_gp, gripper_gap_m=prev_gripper_gap_m)
+        prev_env.load_state(
+            prev_qpos,
+            qvel=None,
+            gripper_pos=prev_gp,
+            gripper_gap_m=prev_gripper_gap_m,
+            gripper_gap_open_ref_m=self._v20_gap_open_ref_m,
+            left_gripper_pos=prev_left_gripper_pos,
+            right_gripper_pos=prev_right_gripper_pos,
+        )
+        prev_env.use_pad_reach = self.version in ("v21", "v22", "v23")
+        prev_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
         curr_env = self._make_env()
-        curr_env.load_state(curr_qpos, qvel=None, gripper_pos=curr_gp, gripper_gap_m=curr_gripper_gap_m)
+        curr_env.load_state(
+            curr_qpos,
+            qvel=None,
+            gripper_pos=curr_gp,
+            gripper_gap_m=curr_gripper_gap_m,
+            gripper_gap_open_ref_m=self._v20_gap_open_ref_m,
+            left_gripper_pos=curr_left_gripper_pos,
+            right_gripper_pos=curr_right_gripper_pos,
+        )
+        curr_env.use_pad_reach = self.version in ("v21", "v22", "v23")
+        curr_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
 
         prev_progress, _, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
             prev_env,
@@ -3127,6 +3518,135 @@ class DenseRewardWrapper:
         self._v20_lower_entry_xy_dist = lower_entry_xy_curr
         return float(stage_penalty + shaping + event + self._success_bonus_post(curr_qpos, None, terminal_bonus))
 
+    def compute_v22_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        prev_gripper_gap_m: Optional[float] = None,
+        curr_gripper_gap_m: Optional[float] = None,
+        prev_left_gripper_pos: Optional[np.ndarray] = None,
+        prev_right_gripper_pos: Optional[np.ndarray] = None,
+        curr_left_gripper_pos: Optional[np.ndarray] = None,
+        curr_right_gripper_pos: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        step_penalty: float = 0.0,
+        **_,
+    ) -> float:
+        """V22/V23 online rewards: v21 semantics with monotonic anti-cycling."""
+        prev_gp = extract_gripper_pos(prev_ob) if prev_ob is not None else None
+        curr_gp = extract_gripper_pos(curr_ob) if curr_ob is not None else None
+
+        if prev_gripper_gap_m is not None:
+            self._v22_gap_open_ref_m = max(self._v22_gap_open_ref_m, float(prev_gripper_gap_m), V20_GRIPPER_GAP_OPEN_FLOOR)
+        elif curr_gripper_gap_m is not None:
+            self._v22_gap_open_ref_m = max(self._v22_gap_open_ref_m, float(curr_gripper_gap_m), V20_GRIPPER_GAP_OPEN_FLOOR)
+
+        prev_env = self._make_env()
+        prev_env.load_state(
+            prev_qpos,
+            qvel=None,
+            gripper_pos=prev_gp,
+            gripper_gap_m=prev_gripper_gap_m,
+            gripper_gap_open_ref_m=self._v22_gap_open_ref_m,
+            left_gripper_pos=prev_left_gripper_pos,
+            right_gripper_pos=prev_right_gripper_pos,
+        )
+        prev_env.use_pad_reach = True
+        prev_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
+        curr_env = self._make_env()
+        curr_env.load_state(
+            curr_qpos,
+            qvel=None,
+            gripper_pos=curr_gp,
+            gripper_gap_m=curr_gripper_gap_m,
+            gripper_gap_open_ref_m=self._v22_gap_open_ref_m,
+            left_gripper_pos=curr_left_gripper_pos,
+            right_gripper_pos=curr_right_gripper_pos,
+        )
+        curr_env.use_pad_reach = True
+        curr_env.pad_reach_threshold = V21_REACH_PAD_CUBE_DIST_THRESHOLD
+
+        prev_progress, prev_stage, prev_subtask_resolved, lower_entry_z_prev, lower_entry_cube_idx_prev, lower_entry_xy_prev = _progress_v18(
+            prev_env,
+            prev_subtask=self._v22_prev_subtask,
+            prev_env=None,
+            lower_entry_z=self._v22_lower_entry_z,
+            lower_entry_cube_idx=self._v22_lower_entry_cube_idx,
+            lower_entry_xy_dist=self._v22_lower_entry_xy_dist,
+        )
+        curr_progress, curr_stage, curr_subtask, lower_entry_z_curr, lower_entry_cube_idx_curr, lower_entry_xy_curr = _progress_v18(
+            curr_env,
+            prev_subtask=prev_subtask_resolved,
+            prev_env=prev_env,
+            lower_entry_z=lower_entry_z_prev,
+            lower_entry_cube_idx=lower_entry_cube_idx_prev,
+            lower_entry_xy_dist=lower_entry_xy_prev,
+        )
+        mono_prev_progress, mono_curr_progress, mono_curr_stage, best_progress_next, best_stage_next = self._monotonic_progress_stage(
+            prev_progress=prev_progress,
+            curr_progress=curr_progress,
+            prev_stage=prev_stage,
+            curr_stage=curr_stage,
+            best_progress=self._v22_best_progress,
+            best_stage=self._v22_best_stage,
+        )
+
+        shaping = shaping_coef * (discount * mono_curr_progress - mono_prev_progress)
+        stage_penalty = self._stage_penalty_from_stage(stage=mono_curr_stage, num_cubes=self.num_cubes, num_substages=4)
+        self._v22_prev_subtask = curr_subtask
+        self._v22_lower_entry_z = lower_entry_z_curr
+        self._v22_lower_entry_cube_idx = lower_entry_cube_idx_curr
+        self._v22_lower_entry_xy_dist = lower_entry_xy_curr
+        self._v22_best_progress = best_progress_next
+        self._v22_best_stage = best_stage_next
+        return float(
+            stage_penalty
+            + shaping
+            + self._success_bonus_post(curr_qpos, None, terminal_bonus)
+            - float(step_penalty)
+        )
+
+    def compute_v23_online_reward(
+        self,
+        prev_qpos: np.ndarray,
+        curr_qpos: np.ndarray,
+        env_reward: float,
+        prev_ob: Optional[np.ndarray] = None,
+        curr_ob: Optional[np.ndarray] = None,
+        prev_gripper_gap_m: Optional[float] = None,
+        curr_gripper_gap_m: Optional[float] = None,
+        prev_left_gripper_pos: Optional[np.ndarray] = None,
+        prev_right_gripper_pos: Optional[np.ndarray] = None,
+        curr_left_gripper_pos: Optional[np.ndarray] = None,
+        curr_right_gripper_pos: Optional[np.ndarray] = None,
+        discount: float = 0.99,
+        terminal_bonus: float = 1.0,
+        shaping_coef: float = 1.0,
+        **_,
+    ) -> float:
+        return self.compute_v22_online_reward(
+            prev_qpos=prev_qpos,
+            curr_qpos=curr_qpos,
+            env_reward=env_reward,
+            prev_ob=prev_ob,
+            curr_ob=curr_ob,
+            prev_gripper_gap_m=prev_gripper_gap_m,
+            curr_gripper_gap_m=curr_gripper_gap_m,
+            prev_left_gripper_pos=prev_left_gripper_pos,
+            prev_right_gripper_pos=prev_right_gripper_pos,
+            curr_left_gripper_pos=curr_left_gripper_pos,
+            curr_right_gripper_pos=curr_right_gripper_pos,
+            discount=discount,
+            terminal_bonus=terminal_bonus,
+            shaping_coef=shaping_coef,
+            step_penalty=self.v23_step_penalty,
+        )
+
     def compute_online_reward(
         self,
         prev_qpos: np.ndarray,
@@ -3136,6 +3656,10 @@ class DenseRewardWrapper:
         curr_ob: Optional[np.ndarray] = None,
         prev_gripper_gap_m: Optional[float] = None,
         curr_gripper_gap_m: Optional[float] = None,
+        prev_left_gripper_pos: Optional[np.ndarray] = None,
+        prev_right_gripper_pos: Optional[np.ndarray] = None,
+        curr_left_gripper_pos: Optional[np.ndarray] = None,
+        curr_right_gripper_pos: Optional[np.ndarray] = None,
         discount: float = 0.99,
         terminal_bonus: float = 1.0,
         shaping_coef: float = 1.0,
@@ -3328,7 +3852,7 @@ class DenseRewardWrapper:
                 terminal_bonus=terminal_bonus,
                 shaping_coef=shaping_coef,
             )
-        if self.version == 'v20':
+        if self.version in ('v20', 'v21'):
             return self.compute_v20_online_reward(
                 prev_qpos=prev_qpos,
                 curr_qpos=curr_qpos,
@@ -3337,6 +3861,44 @@ class DenseRewardWrapper:
                 curr_ob=curr_ob,
                 prev_gripper_gap_m=prev_gripper_gap_m,
                 curr_gripper_gap_m=curr_gripper_gap_m,
+                prev_left_gripper_pos=prev_left_gripper_pos,
+                prev_right_gripper_pos=prev_right_gripper_pos,
+                curr_left_gripper_pos=curr_left_gripper_pos,
+                curr_right_gripper_pos=curr_right_gripper_pos,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v22':
+            return self.compute_v22_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                prev_gripper_gap_m=prev_gripper_gap_m,
+                curr_gripper_gap_m=curr_gripper_gap_m,
+                prev_left_gripper_pos=prev_left_gripper_pos,
+                prev_right_gripper_pos=prev_right_gripper_pos,
+                curr_left_gripper_pos=curr_left_gripper_pos,
+                curr_right_gripper_pos=curr_right_gripper_pos,
+                discount=discount,
+                terminal_bonus=terminal_bonus,
+                shaping_coef=shaping_coef,
+            )
+        if self.version == 'v23':
+            return self.compute_v23_online_reward(
+                prev_qpos=prev_qpos,
+                curr_qpos=curr_qpos,
+                env_reward=env_reward,
+                prev_ob=prev_ob,
+                curr_ob=curr_ob,
+                prev_gripper_gap_m=prev_gripper_gap_m,
+                curr_gripper_gap_m=curr_gripper_gap_m,
+                prev_left_gripper_pos=prev_left_gripper_pos,
+                prev_right_gripper_pos=prev_right_gripper_pos,
+                curr_left_gripper_pos=curr_left_gripper_pos,
+                curr_right_gripper_pos=curr_right_gripper_pos,
                 discount=discount,
                 terminal_bonus=terminal_bonus,
                 shaping_coef=shaping_coef,

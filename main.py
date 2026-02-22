@@ -5,7 +5,12 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger, Jsonl
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
-from envs.rewards.cube_dense_reward import DenseRewardWrapper, extract_gripper_pos, extract_gripper_gap_from_sim
+from envs.rewards.cube_dense_reward import (
+    DenseRewardWrapper,
+    extract_gripper_pos,
+    extract_gripper_gap_from_sim,
+    extract_gripper_pad_positions_from_sim,
+)
 
 from utils.flax_utils import save_agent, restore_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -51,9 +56,10 @@ flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints whe
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
 
-flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v20), None for original rewards')
-flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v20).')
-flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v20: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v20/v21/v22/v23), None for original rewards')
+flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v23).')
+flags.DEFINE_float('dense_shaping_lambda', 10.0, 'Shaping coefficient lambda for v4/v5/v6/v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v20/v21/v22/v23: r=base + lambda*(gamma*Phi(s\')-Phi(s)) + bonus.')
+flags.DEFINE_float('v23_step_penalty', 1.0, 'Per-step penalty used by dense reward v23.')
 flags.DEFINE_bool(
     'randomize_task_init_cube_pos',
     False,
@@ -127,6 +133,7 @@ def main(_):
 
         env_kwargs = dict(
             randomize_task_init=FLAGS.randomize_task_init_cube_pos,
+            randomize_arm_init=False,
             cube_success_threshold=FLAGS.cube_success_threshold,
         )
         if FLAGS.max_episode_steps > 0:
@@ -142,6 +149,7 @@ def main(_):
     else:
         env_kwargs = dict(
             randomize_task_init=FLAGS.randomize_task_init_cube_pos,
+            randomize_arm_init=False,
             cube_success_threshold=FLAGS.cube_success_threshold,
         )
         if FLAGS.max_episode_steps > 0:
@@ -168,6 +176,7 @@ def main(_):
             version=FLAGS.dense_reward_version,
             debug=False,
             success_threshold=FLAGS.cube_success_threshold,
+            v23_step_penalty=FLAGS.v23_step_penalty,
         )
 
     # handle dataset
@@ -230,7 +239,7 @@ def main(_):
                 f"p99={dense_stats['p99']:.4f}, "
                 f"nonzero_frac={nonzero_frac:.4f}"
             )
-            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+            if FLAGS.dense_reward_version in ("v4", "v5", "v6", "v7", "v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                 print(
                     "Dense reward delta-mode check: "
                     f"mean_abs={dense_stats['mean_abs']:.6f}, "
@@ -368,7 +377,14 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress, get_wandb_video_with_z_values, get_wandb_video_with_lift_progress
+                from log_utils import (
+                    get_wandb_video,
+                    get_wandb_video_with_reward,
+                    get_wandb_video_with_progress,
+                    get_wandb_video_with_z_values,
+                    get_wandb_video_with_lift_progress,
+                    get_wandb_video_with_gripper_cube_dists,
+                )
                 video = get_wandb_video(renders)
                 video_reward = get_wandb_video_with_reward(
                     renders,
@@ -379,7 +395,7 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),
@@ -388,7 +404,7 @@ def main(_):
                     )
                     if video_progress is not None:
                         payload['eval/video_progress'] = video_progress
-                if dense_wrapper is not None and dense_wrapper.version in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                     z_values_video = get_wandb_video_with_z_values(
                         renders,
                         render_data.get("cube_z_traces", []),
@@ -397,7 +413,7 @@ def main(_):
                     )
                     if z_values_video is not None:
                         payload['eval/z_values'] = z_values_video
-                if dense_wrapper is not None and dense_wrapper.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                     lift_progress_video = get_wandb_video_with_lift_progress(
                         renders,
                         render_data.get("cube_lift_traces", []),
@@ -407,6 +423,15 @@ def main(_):
                     )
                     if lift_progress_video is not None:
                         payload['eval/lift_progress'] = lift_progress_video
+                if dense_wrapper is not None and dense_wrapper.version in ("v20", "v21", "v22", "v23"):
+                    dist_video = get_wandb_video_with_gripper_cube_dists(
+                        renders,
+                        render_data.get("left_gripper_cube_dist_traces", []),
+                        render_data.get("right_gripper_cube_dist_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if dist_video is not None:
+                        payload["eval/dist"] = dist_video
                 logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
@@ -450,12 +475,15 @@ def main(_):
     # Previous state for wrapper-based dense online rewards.
     prev_qpos_dense = env.unwrapped._data.qpos.copy() if dense_wrapper is not None else None
     prev_gripper_gap_dense = extract_gripper_gap_from_sim(env.unwrapped) if dense_wrapper is not None else None
+    prev_left_gripper_pos_dense, prev_right_gripper_pos_dense = extract_gripper_pad_positions_from_sim(env.unwrapped) if dense_wrapper is not None else (None, None)
     if dense_wrapper is not None:
         dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
-    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20")
+    v8_chunk_shaping = dense_wrapper is not None and dense_wrapper.version in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23")
     chunk_start_qpos_dense = None
     chunk_start_ob_dense = None
     chunk_start_gripper_gap_dense = None
+    chunk_start_left_gripper_pos_dense = None
+    chunk_start_right_gripper_pos_dense = None
     chunk_step_count_dense = 0
     online_success_steps = 0
     online_episode_successes = 0
@@ -503,6 +531,8 @@ def main(_):
                 chunk_start_qpos_dense = prev_qpos_dense.copy()
                 chunk_start_ob_dense = np.array(ob, copy=True)
                 chunk_start_gripper_gap_dense = prev_gripper_gap_dense
+                chunk_start_left_gripper_pos_dense = None if prev_left_gripper_pos_dense is None else prev_left_gripper_pos_dense.copy()
+                chunk_start_right_gripper_pos_dense = None if prev_right_gripper_pos_dense is None else prev_right_gripper_pos_dense.copy()
                 chunk_step_count_dense = 0
         action = action_queue.pop(0)
         
@@ -546,6 +576,7 @@ def main(_):
         elif dense_wrapper is not None:
             curr_qpos_dense = env.unwrapped._data.qpos.copy()
             curr_gripper_gap_dense = extract_gripper_gap_from_sim(env.unwrapped)
+            curr_left_gripper_pos_dense, curr_right_gripper_pos_dense = extract_gripper_pad_positions_from_sim(env.unwrapped)
             if v8_chunk_shaping:
                 base_plus_events = dense_wrapper.compute_online_reward(
                     prev_qpos=prev_qpos_dense,
@@ -555,6 +586,10 @@ def main(_):
                     curr_ob=next_ob,
                     prev_gripper_gap_m=prev_gripper_gap_dense,
                     curr_gripper_gap_m=curr_gripper_gap_dense,
+                    prev_left_gripper_pos=prev_left_gripper_pos_dense,
+                    prev_right_gripper_pos=prev_right_gripper_pos_dense,
+                    curr_left_gripper_pos=curr_left_gripper_pos_dense,
+                    curr_right_gripper_pos=curr_right_gripper_pos_dense,
                     discount=gamma,
                     terminal_bonus=FLAGS.terminal_bonus,
                     shaping_coef=0.0,
@@ -569,11 +604,17 @@ def main(_):
                         chunk_start_qpos_dense,
                         gripper_pos=prev_gp,
                         gripper_gap_m=chunk_start_gripper_gap_dense,
+                        gripper_gap_open_ref_m=getattr(dense_wrapper, "_v22_gap_open_ref_m", getattr(dense_wrapper, "_v20_gap_open_ref_m", None)),
+                        left_gripper_pos=chunk_start_left_gripper_pos_dense,
+                        right_gripper_pos=chunk_start_right_gripper_pos_dense,
                     )
                     curr_progress, _ = dense_wrapper.compute_progress(
                         curr_qpos_dense,
                         gripper_pos=curr_gp,
                         gripper_gap_m=curr_gripper_gap_dense,
+                        gripper_gap_open_ref_m=getattr(dense_wrapper, "_v22_gap_open_ref_m", getattr(dense_wrapper, "_v20_gap_open_ref_m", None)),
+                        left_gripper_pos=curr_left_gripper_pos_dense,
+                        right_gripper_pos=curr_right_gripper_pos_dense,
                     )
                     chunk_shaping = FLAGS.dense_shaping_lambda * (
                         (gamma ** chunk_step_count_dense) * curr_progress - prev_progress
@@ -583,6 +624,8 @@ def main(_):
                     chunk_start_qpos_dense = None
                     chunk_start_ob_dense = None
                     chunk_start_gripper_gap_dense = None
+                    chunk_start_left_gripper_pos_dense = None
+                    chunk_start_right_gripper_pos_dense = None
                     chunk_step_count_dense = 0
             else:
                 int_reward = dense_wrapper.compute_online_reward(
@@ -593,12 +636,18 @@ def main(_):
                     curr_ob=next_ob,
                     prev_gripper_gap_m=prev_gripper_gap_dense,
                     curr_gripper_gap_m=curr_gripper_gap_dense,
+                    prev_left_gripper_pos=prev_left_gripper_pos_dense,
+                    prev_right_gripper_pos=prev_right_gripper_pos_dense,
+                    curr_left_gripper_pos=curr_left_gripper_pos_dense,
+                    curr_right_gripper_pos=curr_right_gripper_pos_dense,
                     discount=gamma,
                     terminal_bonus=FLAGS.terminal_bonus,
                     shaping_coef=FLAGS.dense_shaping_lambda,
                 )
             prev_qpos_dense = curr_qpos_dense
             prev_gripper_gap_dense = curr_gripper_gap_dense
+            prev_left_gripper_pos_dense = None if curr_left_gripper_pos_dense is None else curr_left_gripper_pos_dense.copy()
+            prev_right_gripper_pos_dense = None if curr_right_gripper_pos_dense is None else curr_right_gripper_pos_dense.copy()
 
         transition = dict(
             observations=ob,
@@ -621,10 +670,13 @@ def main(_):
             if dense_wrapper is not None:
                 prev_qpos_dense = env.unwrapped._data.qpos.copy()
                 prev_gripper_gap_dense = extract_gripper_gap_from_sim(env.unwrapped)
+                prev_left_gripper_pos_dense, prev_right_gripper_pos_dense = extract_gripper_pad_positions_from_sim(env.unwrapped)
                 dense_wrapper.set_episode_initial_positions_from_qpos(prev_qpos_dense)
                 chunk_start_qpos_dense = None
                 chunk_start_ob_dense = None
                 chunk_start_gripper_gap_dense = None
+                chunk_start_left_gripper_pos_dense = None
+                chunk_start_right_gripper_pos_dense = None
                 chunk_step_count_dense = 0
         else:
             ob = next_ob
@@ -676,7 +728,14 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
             if len(renders) > 0:
-                from log_utils import get_wandb_video, get_wandb_video_with_reward, get_wandb_video_with_progress, get_wandb_video_with_z_values, get_wandb_video_with_lift_progress
+                from log_utils import (
+                    get_wandb_video,
+                    get_wandb_video_with_reward,
+                    get_wandb_video_with_progress,
+                    get_wandb_video_with_z_values,
+                    get_wandb_video_with_lift_progress,
+                    get_wandb_video_with_gripper_cube_dists,
+                )
                 video = get_wandb_video(renders)
                 video_reward = get_wandb_video_with_reward(
                     renders,
@@ -687,7 +746,7 @@ def main(_):
                 payload = {'eval/video': video}
                 if video_reward is not None:
                     payload['eval/video_reward'] = video_reward
-                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                     video_progress = get_wandb_video_with_progress(
                         renders,
                         render_data.get("progress_traces", []),
@@ -696,7 +755,7 @@ def main(_):
                     )
                     if video_progress is not None:
                         payload['eval/video_progress'] = video_progress
-                if dense_wrapper is not None and dense_wrapper.version in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                     z_values_video = get_wandb_video_with_z_values(
                         renders,
                         render_data.get("cube_z_traces", []),
@@ -705,7 +764,7 @@ def main(_):
                     )
                     if z_values_video is not None:
                         payload['eval/z_values'] = z_values_video
-                if dense_wrapper is not None and dense_wrapper.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"):
+                if dense_wrapper is not None and dense_wrapper.version in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23"):
                     lift_progress_video = get_wandb_video_with_lift_progress(
                         renders,
                         render_data.get("cube_lift_traces", []),
@@ -715,6 +774,15 @@ def main(_):
                     )
                     if lift_progress_video is not None:
                         payload['eval/lift_progress'] = lift_progress_video
+                if dense_wrapper is not None and dense_wrapper.version in ("v20", "v21", "v22", "v23"):
+                    dist_video = get_wandb_video_with_gripper_cube_dists(
+                        renders,
+                        render_data.get("left_gripper_cube_dist_traces", []),
+                        render_data.get("right_gripper_cube_dist_traces", []),
+                        render_data.get("frame_steps", []),
+                    )
+                    if dist_video is not None:
+                        payload["eval/dist"] = dist_video
                 logger.wandb_logger.log(payload, step=log_step)
             
             print(f"Step {log_step} Evaluation: Success Rate = {eval_info.get('success', 0.0):.4f}")
