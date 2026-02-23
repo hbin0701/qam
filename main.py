@@ -46,6 +46,7 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 config_flags.DEFINE_config_file('agent', 'agents/qam.py', lock_config=False)
 
 flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
+flags.DEFINE_integer('dataset_num_samples', 0, "Absolute number of dataset samples to use. 0 means use all samples.")
 flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval, used for large datasets because of memory constraints')
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
@@ -199,6 +200,13 @@ def main(_):
             new_size = int(len(ds['masks']) * FLAGS.dataset_proportion)
             ds = Dataset.create(
                 **{k: v[:new_size] for k, v in ds.items()}
+            )
+
+        if FLAGS.dataset_num_samples > 0:
+            capped_size = min(int(FLAGS.dataset_num_samples), len(ds['masks']))
+            print(f"Using capped dataset size: {capped_size} / {len(ds['masks'])}")
+            ds = Dataset.create(
+                **{k: v[:capped_size] for k, v in ds.items()}
             )
         
         if FLAGS.sparse:
