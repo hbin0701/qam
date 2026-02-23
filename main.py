@@ -1,4 +1,4 @@
-import glob, tqdm, wandb, os, json, random, time, jax
+import glob, tqdm, wandb, os, json, random, time, jax, pickle
 from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger, JsonlLogger
@@ -55,6 +55,11 @@ flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints when the run finishes")
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
+flags.DEFINE_string(
+    'pretrained_actor_path',
+    None,
+    'Path to pretrained actor checkpoint (e.g., exp/.../params_1000000.pkl). Used to initialize actor from BC-pretrained policy.',
+)
 
 flags.DEFINE_string('dense_reward_version', None, 'Dense reward version (v1/v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v20/v21/v22/v23), None for original rewards')
 flags.DEFINE_float('terminal_bonus', 50.0, 'Terminal success bonus added on success steps for dense rewards (v1-v23).')
@@ -266,6 +271,73 @@ def main(_):
         example_batch['actions'],
         config,
     )
+
+    # Load pretrained actor if specified (flow-based algorithms only)
+    if FLAGS.pretrained_actor_path is not None:
+        print(f"Loading pretrained actor from {FLAGS.pretrained_actor_path}")
+        with open(FLAGS.pretrained_actor_path, 'rb') as f:
+            pretrained_dict = pickle.load(f)
+
+        pretrained_params = pretrained_dict['agent']['network']['params']
+        current_params = agent.network.params
+        new_params = dict(current_params)
+        loaded = False
+
+        # Find pretrained flow policy (priority order)
+        pretrained_flow = None
+        for key in ['modules_actor_slow', 'modules_actor_bc_flow', 'modules_actor_flow', 'modules_actor']:
+            if key in pretrained_params:
+                pretrained_flow = pretrained_params[key]
+                print(f"  -> Found pretrained flow policy in {key}")
+                break
+
+        if pretrained_flow is None:
+            print("Warning: No flow policy found in pretrained checkpoint")
+            print(f"  Pretrained keys: {list(pretrained_params.keys())}")
+        else:
+            # QAM/ATQAM/BAM: actor_slow, actor_fast
+            if 'modules_actor_slow' in current_params:
+                new_params['modules_actor_slow'] = pretrained_flow
+                if 'modules_target_actor_slow' in current_params:
+                    new_params['modules_target_actor_slow'] = pretrained_flow
+                print("  -> Loaded into actor_slow, target_actor_slow")
+                if 'modules_actor_fast' in current_params:
+                    new_params['modules_actor_fast'] = pretrained_flow
+                    if 'modules_target_actor_fast' in current_params:
+                        new_params['modules_target_actor_fast'] = pretrained_flow
+                    print("  -> Loaded into actor_fast, target_actor_fast")
+                loaded = True
+
+            # FQL/FEdit/DSRL: actor_bc_flow
+            if 'modules_actor_bc_flow' in current_params:
+                new_params['modules_actor_bc_flow'] = pretrained_flow
+                print("  -> Loaded into actor_bc_flow")
+                if 'modules_target_actor_bc_flow' in current_params:
+                    new_params['modules_target_actor_bc_flow'] = pretrained_flow
+                    print("  -> Loaded into target_actor_bc_flow")
+                loaded = True
+
+            # FBRAC: actor_flow
+            if 'modules_actor_flow' in current_params:
+                new_params['modules_actor_flow'] = pretrained_flow
+                print("  -> Loaded into actor_flow")
+                loaded = True
+
+            # FAWAC/CGQL/IFQL: actor (flow-based)
+            flow_actor_agents = ['fawac', 'cgql', 'ifql']
+            if 'modules_actor' in current_params and config['agent_name'] in flow_actor_agents:
+                new_params['modules_actor'] = pretrained_flow
+                print("  -> Loaded into actor")
+                if 'modules_target_actor' in current_params:
+                    new_params['modules_target_actor'] = pretrained_flow
+                    print("  -> Loaded into target_actor")
+                loaded = True
+
+        if loaded:
+            agent = agent.replace(network=agent.network.replace(params=new_params))
+            print("Pretrained actor loaded successfully!")
+        else:
+            print("Warning: Could not load pretrained actor into current agent.")
 
     params = agent.network.params
     # filter all target network
