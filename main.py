@@ -69,7 +69,7 @@ flags.DEFINE_float('v23_step_penalty', 1.0, 'Per-step penalty used by dense rewa
 flags.DEFINE_bool(
     'randomize_task_init_cube_pos',
     False,
-    'If True, randomize initial cube XY at reset for task-mode OGBench cube envs (single-cube only).',
+    'Deprecated/no-op in current setup. Kept for CLI compatibility.',
 )
 flags.DEFINE_float(
     'cube_success_threshold',
@@ -137,11 +137,7 @@ def main(_):
             print("actual data proportion:", num_subset_datasets / num_datasets)
             dataset_paths = dataset_paths[:num_subset_datasets]
 
-        env_kwargs = dict(
-            randomize_task_init=FLAGS.randomize_task_init_cube_pos,
-            randomize_arm_init=False,
-            cube_success_threshold=FLAGS.cube_success_threshold,
-        )
+        env_kwargs = dict()
         if FLAGS.max_episode_steps > 0:
             env_kwargs['max_episode_steps'] = FLAGS.max_episode_steps
 
@@ -153,11 +149,7 @@ def main(_):
             **env_kwargs,
         )
     else:
-        env_kwargs = dict(
-            randomize_task_init=FLAGS.randomize_task_init_cube_pos,
-            randomize_arm_init=False,
-            cube_success_threshold=FLAGS.cube_success_threshold,
-        )
+        env_kwargs = dict()
         if FLAGS.max_episode_steps > 0:
             env_kwargs['max_episode_steps'] = FLAGS.max_episode_steps
 
