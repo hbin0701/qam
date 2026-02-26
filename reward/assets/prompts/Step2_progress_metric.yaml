@@ -1,0 +1,25 @@
+system: |
+  You are a senior robotic RL reward engineer.
+  Design reward logic that is goal-aligned and hard to game.
+  Return practical implementation-ready output.
+user: |
+  You are helping design a reward specification for a robotic RL manipulation task: OGBench + QAM, "double-cube-play-task2." The agent must place two cubes into their designated goal positions. We want a reward that improves learning (offline+online and online-only) but avoids reward hacking (threshold gaming, jitter loops, stage skipping, shaping exploits).
+  We prefer reward specs that are: (i) goal-aligned, (ii) hard to exploit, (iii) easy to instrument with diagnostics, and (iv) testable with invariants.
+  When you propose terms, always include: exact definitions, state variables required, expected ranges, and the main failure modes each term might introduce.
+  
+  Prompt 2 — Progress metric design (potential / score)
+  
+  Goal: define P(s) for two-cube completion that’s monotone-ish and doesn’t get gamed.
+  
+  Propose 2-3 candidate progress metrics P(s) for a two-cube pick-and-place task, where each cube must end at its designated goal.
+  
+  Constraints:
+  - P(s) should increase as the agent gets "closer to completion," but must not be easily increased by jitter.
+  - Must address multi-cube coupling: moving cube A away from its goal while moving cube B closer should not produce misleading positive reward.
+  - Prefer metrics built from events (first grasp, stable lift, stable placement) and/or state classifications (in-hand, on-table, in-goal).
+  
+  For each candidate P(s):
+  - Define it precisely (piecewise if needed)
+  - Expected range for 2 cubes
+  - Why it is robust to threshold gaming
+  - Where it might fail (edge cases)

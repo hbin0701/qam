@@ -1,0 +1,27 @@
+system: |
+  You are a senior robotic RL reward engineer.
+  Design reward logic that is goal-aligned and hard to game.
+  Return practical implementation-ready output.
+user: |
+  You are helping design a reward specification for a robotic RL manipulation task: OGBench + QAM, "double-cube-play-task2." The agent must place two cubes into their designated goal positions. We want a reward that improves learning (offline+online and online-only) but avoids reward hacking (threshold gaming, jitter loops, stage skipping, shaping exploits).
+  We prefer reward specs that are: (i) goal-aligned, (ii) hard to exploit, (iii) easy to instrument with diagnostics, and (iv) testable with invariants.
+  When you propose terms, always include: exact definitions, state variables required, expected ranges, and the main failure modes each term might introduce.
+  
+  Prompt 7 — Invariant tests (pre-training unit tests for reward)
+  
+  Goal: define tests you can run on random states / scripted rollouts before training.
+  
+  Propose a set of invariant tests for the reward function/spec that can be run pre-training.
+  
+  Examples:
+  - Reward should not increase when moving cubes away from both goals with no other progress
+  - One-shot events should fire at most once per episode per cube
+  - Success should imply stages complete
+  - Shaping should not exceed a max per-step bound
+  
+  For each invariant:
+  - Exact condition
+  - How to generate test states/trajectories (random reset, scripted actions, replay buffer samples)
+  - What failing looks like
+  
+  Output: 10-15 invariants, prioritized.

@@ -1,0 +1,20 @@
+system: |
+  You are a senior robotic RL reward engineer.
+  Design reward logic that is goal-aligned and hard to game.
+  Return practical implementation-ready output.
+user: |
+  You are helping design a reward specification for a robotic RL manipulation task: OGBench + QAM, "double-cube-play-task2." The agent must place two cubes into their designated goal positions. We want a reward that improves learning (offline+online and online-only) but avoids reward hacking (threshold gaming, jitter loops, stage skipping, shaping exploits).
+  We prefer reward specs that are: (i) goal-aligned, (ii) hard to exploit, (iii) easy to instrument with diagnostics, and (iv) testable with invariants.
+  When you propose terms, always include: exact definitions, state variables required, expected ranges, and the main failure modes each term might introduce.
+  
+  Prompt 6 — Failure-mode anticipation checklist (reward hacking risk audit)
+  
+  Goal: pre-mortem your own reward.
+  
+  Given your proposed stage definitions and reward terms, perform a pre-mortem: list the top 8 likely reward-hacking behaviors in this task and how each could arise.
+  
+  For each, propose one mitigation: threshold hysteresis, one-shot events, penalty terms, clipping, or redefining progress.
+  
+  Include "jitter near threshold," "regrasp loops," "stage skipping," and "object switching."
+  
+  Output as a table: Failure mode -> Trigger in reward/spec -> Symptom in logs/videos -> Fix.

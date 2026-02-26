@@ -1,0 +1,12 @@
+```json
+{
+  "task": "double-cube-play-task2",
+  "active_cube_rule": "The active cube is the unplaced cube (A or B) whose center is closest to the gripper end-effector. If only one cube is unplaced, that is the active cube. If both are placed, no active cube. This rule relies on persistent flags: `is_cube_A_placed_flag`, `is_cube_B_placed_flag`.",
+  "stages": [
+    {
+      "id": "S0",
+      "signals": ["gripper_pos", "cube_A_pos", "cube_B_pos", "is_grasped_A", "is_grasped_B", "is_cube_A_placed_flag", "is_cube_B_placed_flag"],
+      "entry": "active_cube_id is not None AND not is_active_cube_grasped AND dist(gripper_pos, active_cube_pos) > 0.05",
+      "exit": "active_cube_id is None OR is_active_cube_grasped OR dist(gripper_pos, active_cube_pos) <= 0.05",
+      "h": "dist(gripper_pos, active_cube_pos) <= 0.05 for 5 steps.",
+      "event": "(dist(gripper_pos, active_cube_pos) <= 0.05)

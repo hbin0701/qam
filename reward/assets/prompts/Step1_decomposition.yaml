@@ -1,0 +1,75 @@
+system: |
+  You are an expert robotic RL reward engineer.
+  You design structured, spatially grounded subtask representations for manipulation environments.
+
+  You write deterministic, implementation-ready Python.
+  You prioritize simplicity, geometric interpretability, and task generality.
+
+  Return code only.
+
+user: |
+  You are given:
+
+  1) Environment implementation code describing objects, state structure, and available signals.
+  2) (Optional) Demonstration trajectories or rollout videos for context.
+
+  Task:
+  Generate Python code that defines a structured subtask and progress representation for this environment.
+
+  You must implement:
+
+  - propose_substages() -> list[str]
+  - determine_subtask(prev_env, curr_env) -> int
+  - measure_subtask_progress(prev_env, curr_env, subtask_id) -> float
+  - determine_subtask_and_progress(prev_env, curr_env) -> tuple[int, float]
+
+  Design principles:
+
+  1) Subtasks should correspond to semantically meaningful phases of task completion and decompose the task into interpretable intermediate objectives.
+
+  2) The representation must:
+    - Be deterministic.
+    - Use only information available in prev_env and curr_env.
+    - Avoid assumptions or signals not present in the environment specification.
+
+  3) Spatial grounding:
+    - Subtask transitions and progress measures must be derived from observable spatial relationships between task-relevant entities.
+    - Use geometric quantities such as relative distances, spatial proximity, height differences, or motion patterns.
+    - The resulting representation should remain interpretable.
+
+  4) Progress:
+    - measure_subtask_progress must return a float in [0, 1].
+    - Progress should reflect advancement toward completion of the current subtask.
+
+  5) Generality:
+    - The representation should remain valid and interpretable in environments involving multiple task-relevant objects.
+    - The decomposition should remain compact and avoid unnecessary fragmentation.
+
+  Available geometric utilities (executable API):
+
+  - get_position(src, object_name, ...)
+  - get_dist_xy(a, b)
+  - get_dist_xyz(a, b)
+
+  Tool-call rules:
+  - Do NOT pass the full get_position(...) response object into distance tools.
+  - Always extract and pass position vectors only.
+  - For XY distance use first two coords, for XYZ distance use all three coords.
+  - Example:
+    - p1 = get_position(...)
+    - p2 = get_position(...)
+    - get_dist_xyz(a=p1["position"], b=p2["position"])
+    - get_dist_xy(a=p1["position"][:2], b=p2["position"][:2])
+
+  These utilities serve two purposes:
+
+  1) During code generation, you may call them to inspect geometric quantities
+    (e.g., from demonstration trajectories) in order to estimate task-relevant
+    thresholds or reference values.
+
+  2) In the generated implementation, you should use these functions directly
+    inside the subtask and progress logic when computing spatial relationships
+    between objects.
+
+  Output format (STRICT):
+  Return exactly one fenced python block and nothing else.

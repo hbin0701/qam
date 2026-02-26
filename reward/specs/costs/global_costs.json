@@ -1,0 +1,15 @@
+{
+  "gemini-2.5-flash": {
+    "global_cost_usd": 0.279559,
+    "input_tokens": 453205,
+    "model": "gemini-2.5-flash",
+    "num_calls": 19,
+    "output_tokens": 4412,
+    "pricing": {
+      "input": 0.3,
+      "output": 2.5
+    },
+    "reasoning_tokens": 53027,
+    "total_tokens": 510644
+  }
+}

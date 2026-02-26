@@ -1,0 +1,278 @@
+{
+  "system_prompt": "You are an expert robotic RL reward engineer.\nYou design structured, spatially grounded subtask representations for manipulation environments.\n\nYou write deterministic, implementation-ready Python.\nYou prioritize simplicity, geometric interpretability, and task generality.\n\nReturn code only.",
+  "user_prompt": "You are given:\n\n1) Environment implementation code describing objects, state structure, and available signals.\n2) (Optional) Demonstration trajectories or rollout videos for context.\n\nTask:\nGenerate Python code that defines a structured subtask and progress representation for this environment.\n\nYou must implement:\n\n- propose_substages() -> list[str]\n- determine_subtask(prev_env, curr_env) -> int\n- measure_subtask_progress(prev_env, curr_env, subtask_id) -> float\n- determine_subtask_and_progress(prev_env, curr_env) -> tuple[int, float]\n\nDesign principles:\n\n1) Subtasks should correspond to semantically meaningful phases of task completion and decompose the task into interpretable intermediate objectives.\n\n2) The representation must:\n  - Be deterministic.\n  - Use only information available in prev_env and curr_env.\n  - Avoid assumptions or signals not present in the environment specification.\n\n3) Spatial grounding:\n  - Subtask transitions and progress measures must be derived from observable spatial relationships between task-relevant entities.\n  - Use geometric quantities such as relative distances, spatial proximity, height differences, or motion patterns.\n  - The resulting representation should remain interpretable.\n\n4) Progress:\n  - measure_subtask_progress must return a float in [0, 1].\n  - Progress should reflect advancement toward completion of the current subtask.\n\n5) Generality:\n  - The representation should remain valid and interpretable in environments involving multiple task-relevant objects.\n  - The decomposition should remain compact and avoid unnecessary fragmentation.\n\nAvailable geometric utilities (executable API):\n\n- get_position(src, object_name, ...)\n- get_dist_xy(a, b)\n- get_dist_xyz(a, b)\n\nTool-call rules:\n- Do NOT pass the full get_position(...) response object into distance tools.\n- Always extract and pass position vectors only.\n- For XY distance use first two coords, for XYZ distance use all three coords.\n- Example:\n  - p1 = get_position(...)\n  - p2 = get_position(...)\n  - get_dist_xyz(a=p1[\"position\"], b=p2[\"position\"])\n  - get_dist_xy(a=p1[\"position\"][:2], b=p2[\"position\"][:2])\n\nThese utilities serve two purposes:\n\n1) During code generation, you may call them to inspect geometric quantities\n  (e.g., from demonstration trajectories) in order to estimate task-relevant\n  thresholds or reference values.\n\n2) In the generated implementation, you should use these functions directly\n  inside the subtask and progress logic when computing spatial relationships\n  between objects.\n\nEnvironment code:\n```python\n\"\"\"\nEnvironment schema for cube-double tasks.\n\nThis module intentionally models environment entities only (no reward logic).\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass\nimport math\nfrom typing import Dict, Mapping, Sequence\n\n# Success criterion (task-level): object is successful if within threshold of goal.\nCUBE_SUCCESS_THRESHOLD = 0.04  # meters\nNUM_CUBES = 2\nTOOL_OBJECT_NAMES = (\"cube_0\", \"cube_1\", \"gripper\", \"goal_0\", \"goal_1\")\nENV_OBJECT_NAMES = TOOL_OBJECT_NAMES\n\n@dataclass\nclass Vector3D:\n    x: float\n    y: float\n    z: float\n\n    @classmethod\n    def from_any(cls, v: \"Vector3D | Sequence[float]\") -> \"Vector3D\":\n        if isinstance(v, cls):\n            return cls(v.x, v.y, v.z)\n        vals = list(v)\n        if len(vals) != 3:\n            raise ValueError(f\"Expected 3 values, got {len(vals)}\")\n        return cls(float(vals[0]), float(vals[1]), float(vals[2]))\n\n    def to_tuple(self) -> tuple[float, float, float]:\n        return (self.x, self.y, self.z)\n\n\n@dataclass\nclass Goal:\n    name: str\n    position: Vector3D\n\n    def __post_init__(self) -> None:\n        self.position = Vector3D.from_any(self.position)\n\n\n@dataclass\nclass Finger:\n    name: str\n    position: Vector3D\n\n    def __post_init__(self) -> None:\n        self.position = Vector3D.from_any(self.position)\n\n\n@dataclass\nclass Gripper:\n    position: Vector3D\n    left: Finger\n    right: Finger\n\n    def __post_init__(self) -> None:\n        self.position = Vector3D.from_any(self.position)\n\n\n@dataclass\nclass Cube:\n    name: str\n    position: Vector3D\n\n    def __post_init__(self) -> None:\n        self.position = Vector3D.from_any(self.position)\n\n\nEXPECTED_OBJECT_TYPES = {\n    \"cube_0\": Cube,\n    \"cube_1\": Cube,\n    \"gripper\": Gripper,\n    \"goal_0\": Goal,\n    \"goal_1\": Goal,\n}\n\n\nclass Env:\n    \"\"\"Base environment entity container.\"\"\"\n\n    def __init__(\n        self,\n        objects: Dict[str, object] | None = None,\n        success_threshold: float = CUBE_SUCCESS_THRESHOLD,\n    ):\n        self.success_threshold = float(success_threshold)\n        self._objects: Dict[str, object] = dict(objects or {})\n        self._validate_required_objects()\n\n    def _validate_required_objects(self) -> None:\n        missing = [name for name in ENV_OBJECT_NAMES if name not in self._objects]\n        if missing:\n            raise ValueError(\n                f\"Env is missing required objects: {missing}. \"\n                f\"Required object names are: {ENV_OBJECT_NAMES}\"\n            )\n        for name in ENV_OBJECT_NAMES:\n            obj = self._objects[name]\n            expected_t = EXPECTED_OBJECT_TYPES.get(name)\n            if expected_t is not None and not isinstance(obj, expected_t):\n                raise ValueError(\n                    f\"Object {name!r} must be of type {expected_t.__name__}, \"\n                    f\"got {type(obj).__name__}\"\n                )\n            if not hasattr(obj, \"position\"):\n                raise ValueError(f\"Object {name!r} must have a 'position' field\")\n            # Ensure position is parseable as Vector3D.\n            Vector3D.from_any(getattr(obj, \"position\"))\n\n    def get_object(self, name: str) -> object:\n        if name not in self._objects:\n            raise KeyError(f\"Unknown object {name!r}. Available: {sorted(self._objects)}\")\n        return self._objects[name]\n\n    def get_position(self, object_name: str) -> Vector3D:\n        obj = self.get_object(object_name)\n        if not hasattr(obj, \"position\"):\n            raise AttributeError(f\"Object {object_name!r} has no position field\")\n        return Vector3D.from_any(getattr(obj, \"position\"))\n\n    @property\n    def object_names(self) -> tuple[str, ...]:\n        return tuple(self._objects.keys())\n\n\nclass Demo:\n    \"\"\"Demo/video trace container indexed by frame number.\"\"\"\n\n    def __init__(\n        self,\n        frames: Mapping[int, Mapping[str, Sequence[float] | Vector3D]] | None = None,\n    ):\n        self._frames: Dict[int, Dict[str, Vector3D]] = {}\n        for frame_num, obj_map in (frames or {}).items():\n            per_frame: Dict[str, Vector3D] = {}\n            for object_name, pos in obj_map.items():\n                per_frame[str(object_name)] = Vector3D.from_any(pos)\n            self._frames[int(frame_num)] = per_frame\n\n    def get_position(self, frame_num: int, object_name: str) -> Vector3D:\n        frame = self._frames.get(int(frame_num))\n        if frame is None:\n            raise KeyError(f\"Unknown frame_num {frame_num}\")\n        if object_name not in frame:\n            raise KeyError(f\"Unknown object {object_name!r} in frame {frame_num}\")\n        return frame[object_name]\n\n    @property\n    def frame_numbers(self) -> tuple[int, ...]:\n        return tuple(sorted(self._frames.keys()))\n\n\ndef get_position(\n    src: str,\n    object_name: str,\n    *,\n    env: Env | None = None,\n    demo: Demo | None = None,\n    frame_num: int | None = None,\n) -> Vector3D:\n    \"\"\"Unified position accessor for env/demo sources.\n\n    - src='env': uses Env.get_position(object_name).\n    - src='demo': uses Demo.get_position(frame_num, object_name). frame_num required.\n    \"\"\"\n    mode = str(src).lower()\n    if mode == \"env\":\n        if env is None:\n            raise ValueError(\"env source requested but env is None\")\n        return env.get_position(object_name)\n    if mode == \"demo\":\n        if demo is None:\n            raise ValueError(\"demo source requested but demo is None\")\n        if frame_num is None:\n            raise ValueError(\"frame_num is required when src='demo'\")\n        return demo.get_position(frame_num=frame_num, object_name=object_name)\n    raise ValueError(f\"Unknown src {src!r}; expected 'env' or 'demo'\")\n\n\ndef get_dist_xy(a: Sequence[float], b: Sequence[float]) -> float:\n    \"\"\"2D Euclidean distance between vectors a and b.\"\"\"\n    av = list(a)\n    bv = list(b)\n    if len(av) != 2 or len(bv) != 2:\n        raise ValueError(\"get_dist_xy expects a and b as length-2 vectors\")\n    ax, ay = float(av[0]), float(av[1])\n    bx, by = float(bv[0]), float(bv[1])\n    return float(math.hypot(ax - bx, ay - by))\n\n\ndef get_dist_xyz(a: Sequence[float], b: Sequence[float]) -> float:\n    \"\"\"3D Euclidean distance between vectors a and b.\"\"\"\n    av = list(a)\n    bv = list(b)\n    if len(av) != 3 or len(bv) != 3:\n        raise ValueError(\"get_dist_xyz expects a and b as length-3 vectors\")\n    ax, ay, az = float(av[0]), float(av[1]), float(av[2])\n    bx, by, bz = float(bv[0]), float(bv[1]), float(bv[2])\n    dx, dy, dz = ax - bx, ay - by, az - bz\n    return float(math.sqrt(dx * dx + dy * dy + dz * dz))\n\n```\n\nOutput format (STRICT):\nReturn exactly one fenced python block and nothing else.",
+  "video_path": "/rlwrld3/home/hyeonbin/RL/qam/artifacts/double_demo.mp4",
+  "sampled_frame_indices": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    22,
+    24,
+    26,
+    28,
+    30,
+    32,
+    34,
+    36,
+    38,
+    40,
+    42,
+    44,
+    46,
+    48,
+    50,
+    52,
+    54,
+    56,
+    58,
+    60,
+    63
+  ],
+  "tool_trace": [
+    {
+      "name": "get_position",
+      "args": {
+        "object_name": "gripper",
+        "src": "demo",
+        "frame_num": 8
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.4289451027385575,
+          -0.08678291993209054,
+          0.09277799119161001
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "object_name": "cube_0",
+        "frame_num": 8,
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.00017961827784922436,
+          0.0032624749435499847,
+          -0.003398466764237437
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "src": "demo",
+        "frame_num": 10,
+        "object_name": "gripper"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.39519929901723994,
+          -0.10389351427433557,
+          0.050582095842440424
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "object_name": "cube_0",
+        "frame_num": 10,
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.00018225498349928372,
+          0.0033216176441727262,
+          -0.0034207574592696388
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "object_name": "cube_0",
+        "src": "demo",
+        "frame_num": 0
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.00016624212065055006,
+          0.0013760215993202146,
+          -0.0016921401599423443
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "object_name": "cube_1",
+        "frame_num": 0,
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.344045535010721,
+          -0.0980386221642049,
+          0.019948878463601077
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "frame_num": 0,
+        "src": "demo",
+        "object_name": "goal_0"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.35,
+          0.1,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "object_name": "goal_1",
+        "frame_num": 0,
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.5,
+          0.1,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "frame_num": 0,
+        "object_name": "cube_0",
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.00016624212065055006,
+          0.0013760215993202146,
+          -0.0016921401599423443
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "frame_num": 0,
+        "src": "demo",
+        "object_name": "cube_1"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.344045535010721,
+          -0.0980386221642049,
+          0.019948878463601077
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "src": "demo",
+        "frame_num": 0,
+        "object_name": "goal_0"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.35,
+          0.1,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "frame_num": 0,
+        "object_name": "goal_1",
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.5,
+          0.1,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "get_position",
+      "args": {
+        "frame_num": 0,
+        "object_name": "gripper",
+        "src": "demo"
+      },
+      "result": {
+        "ok": true,
+        "position": [
+          0.5672482154682396,
+          0.016389252729151742,
+          0.23016394812060978
+        ]
+      }
+    }
+  ],
+  "raw_response": "",
+  "response_debug": {
+    "response_text_len": 0,
+    "finish_reasons": [
+      "MALFORMED_FUNCTION_CALL"
+    ],
+    "usage_metadata": {
+      "prompt_token_count": 12400,
+      "candidates_token_count": 0,
+      "thoughts_token_count": 0,
+      "total_token_count": 12400
+    },
+    "prompt_feedback": {
+      "block_reason": null,
+      "safety_ratings": null
+    },
+    "candidates": [
+      {
+        "index": 0,
+        "finish_reason": "MALFORMED_FUNCTION_CALL",
+        "safety_ratings": null,
+        "part_count": 0,
+        "function_call_count": 0,
+        "text_part_lengths": []
+      }
+    ]
+  },
+  "parsed_json": null,
+  "python_code": ""
+}

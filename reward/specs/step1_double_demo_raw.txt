@@ -1,0 +1,19 @@
+```json
+{
+  "task": "double-cube-play-task2",
+  "active_cube_rule": "Select unplaced cube closest to gripper. If one placed, select the other. If both placed, none. (A_placed/B_placed are sticky flags).",
+  "stages": [
+    {
+      "id": "S0",
+      "signals": ["gripper_pos", "cube_A_pos", "cube_B_pos", "gripper_open_state"],
+      "entry": "!(A_placed || B_placed) && !A_grasped && !B_grasped",
+      "exit": "(A_grasped && !A_placed) || (B_grasped && !B_placed)",
+      "h": "Exit for 5 steps. A_grasped: dist(gripper,A)<0.03 & gripper_open<0.1. B_grasped similar.",
+      "event": "First cube grasped.",
+      "exploit": "Hover near cube without grasping; grasp and immediately release.",
+      "guard": "Hysteresis on grasp. 'placed_flag' is sticky."
+    },
+    {
+      "id": "S1",
+      "signals": ["gripper_pos", "cube_A_pos", "cube_B_pos", "goal_A_pos", "goal_B_pos", "gripper_open_state"],
+      "entry": "(A_

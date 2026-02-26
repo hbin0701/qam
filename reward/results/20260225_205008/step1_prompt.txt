@@ -1,0 +1,252 @@
+[SYSTEM]
+You are an expert robotic RL reward engineer.
+You design structured, spatially grounded subtask representations for manipulation environments.
+
+You write deterministic, implementation-ready Python.
+You prioritize simplicity, geometric interpretability, and task generality.
+
+Return code only.
+
+[USER]
+You are given:
+
+1) Environment implementation code describing objects, state structure, and available signals.
+2) (Optional) Demonstration trajectories or rollout videos for context.
+
+Task:
+Generate Python code that defines a structured subtask and progress representation for this environment.
+
+You must implement:
+
+- propose_substages() -> list[str]
+- determine_subtask(prev_env, curr_env) -> int
+- measure_subtask_progress(prev_env, curr_env, subtask_id) -> float
+- determine_subtask_and_progress(prev_env, curr_env) -> tuple[int, float]
+
+Design principles:
+
+1) Subtasks should correspond to semantically meaningful phases of task completion and decompose the task into interpretable intermediate objectives.
+
+2) The representation must:
+  - Be deterministic.
+  - Use only information available in prev_env and curr_env.
+  - Avoid assumptions or signals not present in the environment specification.
+
+3) Spatial grounding:
+  - Subtask transitions and progress measures must be derived from observable spatial relationships between task-relevant entities.
+  - Use geometric quantities such as relative distances, spatial proximity, height differences, or motion patterns.
+  - The resulting representation should remain interpretable.
+
+4) Progress:
+  - measure_subtask_progress must return a float in [0, 1].
+  - Progress should reflect advancement toward completion of the current subtask.
+
+5) Generality:
+  - The representation should remain valid and interpretable in environments involving multiple task-relevant objects.
+  - The decomposition should remain compact and avoid unnecessary fragmentation.
+
+Available geometric utilities (executable API):
+
+- get_position(src, object_name, ...)
+- get_dist_xy(a, b)
+- get_dist_xyz(a, b)
+
+These utilities serve two purposes:
+
+1) During code generation, you may call them to inspect geometric quantities
+  (e.g., from demonstration trajectories) in order to estimate task-relevant
+  thresholds or reference values.
+
+2) In the generated implementation, you should use these functions directly
+  inside the subtask and progress logic when computing spatial relationships
+  between objects.
+
+Output format (STRICT):
+Return exactly one fenced python block and nothing else.
+
+Environment code:
+```python
+"""
+Environment schema for cube-double tasks.
+
+This module intentionally models environment entities only (no reward logic).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Mapping, Sequence
+
+# Success criterion (task-level): object is successful if within threshold of goal.
+CUBE_SUCCESS_THRESHOLD = 0.04  # meters
+NUM_CUBES = 2
+TOOL_OBJECT_NAMES = ("cube_0", "cube_1", "gripper", "goal_0", "goal_1")
+ENV_OBJECT_NAMES = TOOL_OBJECT_NAMES
+
+@dataclass
+class Vector3D:
+    x: float
+    y: float
+    z: float
+
+    @classmethod
+    def from_any(cls, v: "Vector3D | Sequence[float]") -> "Vector3D":
+        if isinstance(v, cls):
+            return cls(v.x, v.y, v.z)
+        vals = list(v)
+        if len(vals) != 3:
+            raise ValueError(f"Expected 3 values, got {len(vals)}")
+        return cls(float(vals[0]), float(vals[1]), float(vals[2]))
+
+    def to_tuple(self) -> tuple[float, float, float]:
+        return (self.x, self.y, self.z)
+
+
+@dataclass
+class Goal:
+    name: str
+    position: Vector3D
+
+    def __post_init__(self) -> None:
+        self.position = Vector3D.from_any(self.position)
+
+
+@dataclass
+class Finger:
+    name: str
+    position: Vector3D
+
+    def __post_init__(self) -> None:
+        self.position = Vector3D.from_any(self.position)
+
+
+@dataclass
+class Gripper:
+    position: Vector3D
+    left: Finger
+    right: Finger
+
+    def __post_init__(self) -> None:
+        self.position = Vector3D.from_any(self.position)
+
+
+@dataclass
+class Cube:
+    name: str
+    position: Vector3D
+
+    def __post_init__(self) -> None:
+        self.position = Vector3D.from_any(self.position)
+
+
+EXPECTED_OBJECT_TYPES = {
+    "cube_0": Cube,
+    "cube_1": Cube,
+    "gripper": Gripper,
+    "goal_0": Goal,
+    "goal_1": Goal,
+}
+
+
+class Env:
+    """Base environment entity container."""
+
+    def __init__(
+        self,
+        objects: Dict[str, object] | None = None,
+        success_threshold: float = CUBE_SUCCESS_THRESHOLD,
+    ):
+        self.success_threshold = float(success_threshold)
+        self._objects: Dict[str, object] = dict(objects or {})
+        self._validate_required_objects()
+
+    def _validate_required_objects(self) -> None:
+        missing = [name for name in ENV_OBJECT_NAMES if name not in self._objects]
+        if missing:
+            raise ValueError(
+                f"Env is missing required objects: {missing}. "
+                f"Required object names are: {ENV_OBJECT_NAMES}"
+            )
+        for name in ENV_OBJECT_NAMES:
+            obj = self._objects[name]
+            expected_t = EXPECTED_OBJECT_TYPES.get(name)
+            if expected_t is not None and not isinstance(obj, expected_t):
+                raise ValueError(
+                    f"Object {name!r} must be of type {expected_t.__name__}, "
+                    f"got {type(obj).__name__}"
+                )
+            if not hasattr(obj, "position"):
+                raise ValueError(f"Object {name!r} must have a 'position' field")
+            # Ensure position is parseable as Vector3D.
+            Vector3D.from_any(getattr(obj, "position"))
+
+    def get_object(self, name: str) -> object:
+        if name not in self._objects:
+            raise KeyError(f"Unknown object {name!r}. Available: {sorted(self._objects)}")
+        return self._objects[name]
+
+    def get_position(self, object_name: str) -> Vector3D:
+        obj = self.get_object(object_name)
+        if not hasattr(obj, "position"):
+            raise AttributeError(f"Object {object_name!r} has no position field")
+        return Vector3D.from_any(getattr(obj, "position"))
+
+    @property
+    def object_names(self) -> tuple[str, ...]:
+        return tuple(self._objects.keys())
+
+
+class Demo:
+    """Demo/video trace container indexed by frame number."""
+
+    def __init__(
+        self,
+        frames: Mapping[int, Mapping[str, Sequence[float] | Vector3D]] | None = None,
+    ):
+        self._frames: Dict[int, Dict[str, Vector3D]] = {}
+        for frame_num, obj_map in (frames or {}).items():
+            per_frame: Dict[str, Vector3D] = {}
+            for object_name, pos in obj_map.items():
+                per_frame[str(object_name)] = Vector3D.from_any(pos)
+            self._frames[int(frame_num)] = per_frame
+
+    def get_position(self, frame_num: int, object_name: str) -> Vector3D:
+        frame = self._frames.get(int(frame_num))
+        if frame is None:
+            raise KeyError(f"Unknown frame_num {frame_num}")
+        if object_name not in frame:
+            raise KeyError(f"Unknown object {object_name!r} in frame {frame_num}")
+        return frame[object_name]
+
+    @property
+    def frame_numbers(self) -> tuple[int, ...]:
+        return tuple(sorted(self._frames.keys()))
+
+
+def get_position(
+    src: str,
+    object_name: str,
+    *,
+    env: Env | None = None,
+    demo: Demo | None = None,
+    frame_num: int | None = None,
+) -> Vector3D:
+    """Unified position accessor for env/demo sources.
+
+    - src='env': uses Env.get_position(object_name).
+    - src='demo': uses Demo.get_position(frame_num, object_name). frame_num required.
+    """
+    mode = str(src).lower()
+    if mode == "env":
+        if env is None:
+            raise ValueError("env source requested but env is None")
+        return env.get_position(object_name)
+    if mode == "demo":
+        if demo is None:
+            raise ValueError("demo source requested but demo is None")
+        if frame_num is None:
+            raise ValueError("frame_num is required when src='demo'")
+        return demo.get_position(frame_num=frame_num, object_name=object_name)
+    raise ValueError(f"Unknown src {src!r}; expected 'env' or 'demo'")
+
+```

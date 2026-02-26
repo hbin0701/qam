@@ -8,3 +8,4 @@ bash scripts/triple/online/run_task2_dense_v4.sh
 bash scripts/triple/online/run_task2_dense_v5.sh
 bash scripts/triple/online/run_task2_dense_v6.sh
 bash scripts/triple/online/run_task2_dense_v7.sh
+bash scripts/triple/online/run_task2_dense_v30.sh

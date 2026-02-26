@@ -1,0 +1,121 @@
+```python
+def propose_substages() -> list[str]:
+    return [
+        "move_to_cube_0",
+        "pick_cube_0",
+        "move_cube_0_to_goal_0",
+        "place_cube_0_at_goal_0",
+        "move_to_cube_1",
+        "pick_cube_1",
+        "move_cube_1_to_goal_1",
+        "place_cube_1_at_goal_1",
+    ]
+
+
+def determine_subtask(prev_env, curr_env) -> int:
+    gripper_pos = default_api.get_position(src="env", object_name="gripper", time_ref="curr")
+    cube_0_pos = default_api.get_position(src="env", object_name="cube_0", time_ref="curr")
+    cube_1_pos = default_api.get_position(src="env", object_name="cube_1", time_ref="curr")
+    goal_0_pos = default_api.get_position(src="env", object_name="goal_0", time_ref="curr")
+    goal_1_pos = default_api.get_position(src="env", object_name="goal_1", time_ref="curr")
+
+    dist_gripper_to_cube_0 = default_api.get_dist_xyz(gripper_pos.to_tuple(), cube_0_pos.to_tuple())["distance"]
+    dist_cube_0_to_goal_0 = default_api.get_dist_xyz(cube_0_pos.to_tuple(), goal_0_pos.to_tuple())["distance"]
+    dist_gripper_to_cube_1 = default_api.get_dist_xyz(gripper_pos.to_tuple(), cube_1_pos.to_tuple())["distance"]
+    dist_cube_1_to_goal_1 = default_api.get_dist_xyz(cube_1_pos.to_tuple(), goal_1_pos.to_tuple())["distance"]
+
+    # Thresholds
+    GRIPPER_CUBE_THRESHOLD = 0.05
+    CUBE_GOAL_THRESHOLD = 0.04
+
+    # Subtask 0: move_to_cube_0
+    if dist_gripper_to_cube_0 > GRIPPER_CUBE_THRESHOLD and dist_cube_0_to_goal_0 > CUBE_GOAL_THRESHOLD:
+        return 0
+    # Subtask 1: pick_cube_0
+    elif dist_gripper_to_cube_0 <= GRIPPER_CUBE_THRESHOLD and dist_cube_0_to_goal_0 > CUBE_GOAL_THRESHOLD:
+        return 1
+    # Subtask 2: move_cube_0_to_goal_0
+    elif dist_gripper_to_cube_0 <= GRIPPER_CUBE_THRESHOLD and dist_cube_0_to_goal_0 > CUBE_GOAL_THRESHOLD:
+        return 2
+    # Subtask 3: place_cube_0_at_goal_0
+    elif dist_cube_0_to_goal_0 <= CUBE_GOAL_THRESHOLD and dist_gripper_to_cube_0 > GRIPPER_CUBE_THRESHOLD:
+        return 3
+    # Subtask 4: move_to_cube_1
+    elif dist_gripper_to_cube_1 > GRIPPER_CUBE_THRESHOLD and dist_cube_1_to_goal_1 > CUBE_GOAL_THRESHOLD:
+        return 4
+    # Subtask 5: pick_cube_1
+    elif dist_gripper_to_cube_1 <= GRIPPER_CUBE_THRESHOLD and dist_cube_1_to_goal_1 > CUBE_GOAL_THRESHOLD:
+        return 5
+    # Subtask 6: move_cube_1_to_goal_1
+    elif dist_gripper_to_cube_1 <= GRIPPER_CUBE_THRESHOLD and dist_cube_1_to_goal_1 > CUBE_GOAL_THRESHOLD:
+        return 6
+    # Subtask 7: place_cube_1_at_goal_1
+    elif dist_cube_1_to_goal_1 <= CUBE_GOAL_THRESHOLD and dist_gripper_to_cube_1 > GRIPPER_CUBE_THRESHOLD:
+        return 7
+    return 0
+
+
+def measure_subtask_progress(prev_env, curr_env, subtask_id) -> float:
+    gripper_pos = default_api.get_position(src="env", object_name="gripper", time_ref="curr")
+    cube_0_pos = default_api.get_position(src="env", object_name="cube_0", time_ref="curr")
+    cube_1_pos = default_api.get_position(src="env", object_name="cube_1", time_ref="curr")
+    goal_0_pos = default_api.get_position(src="env", object_name="goal_0", time_ref="curr")
+    goal_1_pos = default_api.get_position(src="env", object_name="goal_1", time_ref="curr")
+
+    # Thresholds
+    GRIPPER_CUBE_THRESHOLD = 0.05
+    CUBE_GOAL_THRESHOLD = 0.04
+
+    if subtask_id == 0:  # move_to_cube_0
+        dist = default_api.get_dist_xyz(gripper_pos.to_tuple(), cube_0_pos.to_tuple())["distance"]
+        initial_dist = default_api.get_dist_xyz(
+            default_api.get_position(src="env", object_name="gripper", time_ref="prev").to_tuple(),
+            default_api.get_position(src="env", object_name="cube_0", time_ref="prev").to_tuple(),
+        )["distance"]
+        progress = 1.0 - (dist / initial_dist) if initial_dist > 0 else 1.0
+        return max(0.0, min(1.0, progress))
+    elif subtask_id == 1:  # pick_cube_0
+        dist = default_api.get_dist_xyz(gripper_pos.to_tuple(), cube_0_pos.to_tuple())["distance"]
+        return max(0.0, min(1.0, 1.0 - (dist / GRIPPER_CUBE_THRESHOLD)))
+    elif subtask_id == 2:  # move_cube_0_to_goal_0
+        dist = default_api.get_dist_xyz(cube_0_pos.to_tuple(), goal_0_pos.to_tuple())["distance"]
+        initial_dist = default_api.get_dist_xyz(
+            default_api.get_position(src="env", object_name="cube_0", time_ref="prev").to_tuple(),
+            default_api.get_position(src="env", object_name="goal_0", time_ref="prev").to_tuple(),
+        )["distance"]
+        progress = 1.0 - (dist / initial_dist) if initial_dist > 0 else 1.0
+        return max(0.0, min(1.0, progress))
+    elif subtask_id == 3:  # place_cube_0_at_goal_0
+        dist = default_api.get_dist_xyz(cube_0_pos.to_tuple(), goal_0_pos.to_tuple())["distance"]
+        return max(0.0, min(1.0, 1.0 - (dist / CUBE_GOAL_THRESHOLD)))
+    elif subtask_id == 4:  # move_to_cube_1
+        dist = default_api.get_dist_xyz(gripper_pos.to_tuple(), cube_1_pos.to_tuple())["distance"]
+        initial_dist = default_api.get_dist_xyz(
+            default_api.get_position(src="env", object_name="gripper", time_ref="prev").to_tuple(),
+            default_api.get_position(src="env", object_name="cube_1", time_ref="prev").to_tuple(),
+        )["distance"]
+        progress = 1.0 - (dist / initial_dist) if initial_dist > 0 else 1.0
+        return max(0.0, min(1.0, progress))
+    elif subtask_id == 5:  # pick_cube_1
+        dist = default_api.get_dist_xyz(gripper_pos.to_tuple(), cube_1_pos.to_tuple())["distance"]
+        return max(0.0, min(1.0, 1.0 - (dist / GRIPPER_CUBE_THRESHOLD)))
+    elif subtask_id == 6:  # move_cube_1_to_goal_1
+        dist = default_api.get_dist_xyz(cube_1_pos.to_tuple(), goal_1_pos.to_tuple())["distance"]
+        initial_dist = default_api.get_dist_xyz(
+            default_api.get_position(src="env", object_name="cube_1", time_ref="prev").to_tuple(),
+            default_api.get_position(src="env", object_name="goal_1", time_ref="prev").to_tuple(),
+        )["distance"]
+        progress = 1.0 - (dist / initial_dist) if initial_dist > 0 else 1.0
+        return max(0.0, min(1.0, progress))
+    elif subtask_id == 7:  # place_cube_1_at_goal_1
+        dist = default_api.get_dist_xyz(cube_1_pos.to_tuple(), goal_1_pos.to_tuple())["distance"]
+        return max(0.0, min(1.0, 1.0 - (dist / CUBE_GOAL_THRESHOLD)))
+    return 0.0
+
+
+def determine_subtask_and_progress(prev_env, curr_env) -> tuple[int, float]:
+    subtask_id = determine_subtask(prev_env, curr_env)
+    progress = measure_subtask_progress(prev_env, curr_env, subtask_id)
+    return subtask_id, progress
+
+```

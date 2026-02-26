@@ -1,0 +1,41 @@
+```python
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+
+# Constants from the provided environment code
+CUBE_SUCCESS_THRESHOLD = 0.04
+GRIPPER_HOME = np.array([0.425, 0.0, 0.275])
+V6_GRIPPER_CLOSED_THRESHOLD = 0.50
+V6_GRIPPER_CLOSED_REF = 0.56
+V6_GRASP_LIFT_TARGET = 0.02
+V20_GRIPPER_GAP_CLOSE_REF = 0.055
+V20_PAD_CUBE_DIST_THRESHOLD = 0.045
+V20_PAD_CUBE_AVG_DIST_THRESHOLD = 0.04
+V21_REACH_PAD_CUBE_DIST_THRESHOLD = 0.07
+V27_REACH_DIST_THRESHOLD = 0.07
+V27_REACH_XY_THRESHOLD = 0.03
+V27_REACH_Z_THRESHOLD = 0.02
+V27_GRASP_CLOSE_THRESHOLD = 0.50
+V27_GRASP_CLOSE_BASE = 0.45
+V27_GRASP_LIFT_CONFIRM = 0.02
+V28_RELEASE_OPEN_THRESHOLD = 0.45
+V29_RELEASE_Z_MAX_ABOVE_INIT = 0.01
+V29_POST_RELEASE_LIFT_DELTA = 0.03
+V30_STAGE1_CLOSE_THRESHOLD = 0.53
+V30_STAGE1_CLOSE_REF = 0.563
+
+# Assume a fixed task for this implementation, e.g., double cube task 1
+# In a real scenario, this would be passed or inferred from the environment.
+TASK_GOALS = {
+    ('double', 1): np.array([[0.425, 0.0, 0.02], [0.425, 0.1, 0.02]]),
+}
+TASK_INITS = {
+    ('double', 1): np.array([[0.425, 0.0, 0.02], [0.425, -0.1, 0.02]]),
+}
+
+# Helper functions from the environment code
+def compute_cube_order(init_positions: np.ndarray, reference: np.ndarray = GRIPPER_HOME) -> List[int]:
+    dists = [np.linalg.norm(reference - init_positions[i]) for i in range(len(init_positions))]
+    return list(np.argsort(dists))
+
+def gripper_close_from_gap(gripper_gap_m: float, open_ref: float

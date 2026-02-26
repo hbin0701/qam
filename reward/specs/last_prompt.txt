@@ -1,0 +1,100 @@
+You are helping design a reward specification for a robotic RL manipulation task: OGBench + QAM, "double-cube-play-task2." The agent must place two cubes into their designated goal positions. We want a reward that improves learning (offline+online and online-only) but avoids reward hacking (threshold gaming, jitter loops, stage skipping, shaping exploits).
+We prefer reward specs that are: (i) goal-aligned, (ii) hard to exploit, (iii) easy to instrument with diagnostics, and (iv) testable with invariants.
+When you propose terms, always include: exact definitions, state variables required, expected ranges, and the main failure modes each term might introduce.
+
+Prompt 1 — Task decomposition into stages (two cubes, two goals)
+Goal: define stages that are robust in a multi-object setting (avoid "progress cancels out" issues).
+Decompose "double-cube-play-task2" into a minimal set of stages that are (a) necessary for success, (b) observable from OGBench/QAM signals, and (c) hard to spoof.
+Requirements:
+- Must handle two cubes without assuming a fixed order, but you may propose an "active cube" selection rule if needed.
+- Each stage must have entry/exit conditions with explicit thresholds and hysteresis if relevant.
+- Include a "stage completion" event definition that fires once to prevent farming.
+- For each stage, list "most common exploit" and "anti-exploit guard."
+Output format:
+- Stage list: S0...Sk
+- For each Si: observable signals used, condition, hysteresis, one-shot event, exploit, guard.
+
+Prompt 2 — Progress metric design (potential / score)
+Goal: define P(s) for two-cube completion that’s monotone-ish and doesn’t get gamed.
+Propose 2-3 candidate progress metrics P(s) for a two-cube pick-and-place task, where each cube must end at its designated goal.
+Constraints:
+- P(s) should increase as the agent gets "closer to completion," but must not be easily increased by jitter.
+- Must address multi-cube coupling: moving cube A away from its goal while moving cube B closer should not produce misleading positive reward.
+- Prefer metrics built from events (first grasp, stable lift, stable placement) and/or state classifications (in-hand, on-table, in-goal).
+For each candidate P(s):
+- Define it precisely (piecewise if needed)
+- Expected range for 2 cubes
+- Why it is robust to threshold gaming
+- Where it might fail (edge cases)
+
+Prompt 3 — Active cube / assignment rule (prevents cancellation)
+Goal: avoid "reward cancels out" when you approach one cube and distance to the other increases.
+Define an "active object selection" or "assignment" mechanism for two cubes that avoids reward cancellation and prevents oscillations between cubes.
+Options you may consider:
+- fixed order, greedy by closest-to-grasp, Hungarian matching to goals, soft assignment, or commitment windows (stick with one cube for N steps after progress).
+Requirements:
+- Must prevent the policy from farming reward by switching targets every few steps.
+- Must work when both cubes are partially progressed (e.g., one grasped, other near goal).
+Output: the rule + exact signals + a short argument for why it avoids exploitation.
+
+Prompt 4 — Reward terms menu (choose a "safe" subset)
+Goal: propose the actual reward structure: step penalty + shaping + event bonuses.
+Design a reward r_t for double-cube-play-task2 using a small number of terms.
+Mandatory: include (i) urgency/step pressure, and (ii) terminal success bonus.
+Optional: use shaping, but only if you can argue it won’t create farming loops.
+For each term, include: formula, scale/range, what behavior it incentivizes, and failure modes it might introduce.
+Also propose default coefficient magnitudes (order-of-magnitude) and which ones are most sensitive.
+Output:
+- Final proposed r_t
+- Term-by-term rationale
+- A "minimal version" (fewest terms) and a "richer version" (more guidance)
+
+Prompt 5 — Success definition & anti-spoofing
+Goal: success condition must match OGBench task success and be robust to transient contacts.
+Specify a robust success condition for placing two cubes in designated goals.
+Requirements:
+- Use "stable for K steps" and/or velocity thresholds to avoid momentary threshold hits.
+- Define how you detect cube-goal match (designated goal, not either goal).
+- Include any tolerance parameters and how to choose them.
+Output: success predicate + stability criteria + parameters.
+
+Prompt 6 — Failure-mode anticipation checklist (reward hacking risk audit)
+Goal: pre-mortem your own reward.
+Given your proposed stage definitions and reward terms, perform a pre-mortem: list the top 8 likely reward-hacking behaviors in this task and how each could arise.
+For each, propose one mitigation: threshold hysteresis, one-shot events, penalty terms, clipping, or redefining progress.
+Include "jitter near threshold," "regrasp loops," "stage skipping," and "object switching."
+Output as a table: Failure mode -> Trigger in reward/spec -> Symptom in logs/videos -> Fix.
+
+Prompt 7 — Invariant tests (pre-training unit tests for reward)
+Goal: define tests you can run on random states / scripted rollouts before training.
+Propose a set of invariant tests for the reward function/spec that can be run pre-training.
+Examples:
+- Reward should not increase when moving cubes away from both goals with no other progress
+- One-shot events should fire at most once per episode per cube
+- Success should imply stages complete
+- Shaping should not exceed a max per-step bound
+For each invariant:
+- Exact condition
+- How to generate test states/trajectories (random reset, scripted actions, replay buffer samples)
+- What failing looks like
+Output: 10-15 invariants, prioritized.
+
+Prompt 8 — Logging spec (what you must record to debug later)
+Goal: define what to log so Phase 2 diagnostics are possible.
+Define the minimal logging required to diagnose reward issues for double-cube-play-task2.
+Must include per-step: stage id, active cube id, per-term reward breakdown, cube-goal distances, grasp/contact flags, "in-hand" state, placement stability counters, and success predicate.
+Output: list of fields + brief reason each is necessary.
+
+After answering prompts 1..8, produce implementation-ready Python reward code.
+Code requirements:
+- Target file style: qam/envs/rewards/*.py compatible.
+- Include a main callable similar to: compute_reward(obs, next_obs, info, state) -> (reward, state, diagnostics).
+- Include one-shot event latches in state.
+- Include active-cube commitment logic.
+- Include success and stability counters.
+- Include per-term diagnostic outputs.
+- Keep it deterministic and avoid placeholder pseudo-code.
+
+Return format:
+1) "DESIGN" section (concise but complete)
+2) "PYTHON_CODE" section with one fenced python block only.

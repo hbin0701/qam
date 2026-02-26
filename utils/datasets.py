@@ -43,7 +43,29 @@ class Dataset(FrozenDict):
         return batch
 
     def sample_sequence(self, batch_size, sequence_length, discount):
-        idxs = np.random.randint(self.size - sequence_length + 1, size=batch_size)
+        max_start = self.size - sequence_length
+        if max_start < 0:
+            raise ValueError(f"sequence_length={sequence_length} exceeds dataset size={self.size}")
+
+        idxs = np.random.randint(max_start + 1, size=batch_size)
+        cube_targets = self._dict.get('cube_targets', None)
+        success_counts = self._dict.get('success_counts', None)
+        if cube_targets is not None and success_counts is not None:
+            # Optional rejection sampling:
+            # accept only windows that stay on one target cube,
+            # unless there is a completion event inside the sampled window.
+            max_resample_tries = 32
+            for j in range(batch_size):
+                for _ in range(max_resample_tries):
+                    s = int(idxs[j])
+                    e = s + sequence_length
+                    window_targets = cube_targets[s:e]
+                    known_targets = window_targets[window_targets >= 0]
+                    mixed_targets = len(np.unique(known_targets)) >= 2
+                    completion_in_window = bool(np.max(success_counts[s:e]) > success_counts[s])
+                    if (not mixed_targets) or completion_in_window:
+                        break
+                    idxs[j] = np.random.randint(max_start + 1)
         
         data = {k: v[idxs] for k, v in self.items()}
 

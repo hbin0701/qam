@@ -1,0 +1,31 @@
+label,step,mean_success,std_success,count
+Reward Shaped (Human),10000,0.0,0.0,1
+Reward Shaped (Human),20000,0.0,0.0,1
+Reward Shaped (Human),30000,0.04,0.0,1
+Reward Shaped (Human),40000,0.44,0.0,1
+Reward Shaped (Human),50000,0.7,0.0,1
+Reward Shaped (Human),60000,0.7,0.0,1
+Reward Shaped (Human),70000,0.74,0.0,1
+Reward Shaped (Human),80000,0.7,0.0,1
+Reward Shaped (Human),90000,0.9,0.0,1
+Reward Shaped (Human),100000,0.94,0.0,1
+Reward Shaped (Human),110000,0.94,0.0,1
+Reward Shaped (Human),120000,0.9,0.0,1
+Reward Shaped (Human),130000,0.92,0.0,1
+Reward Shaped (Human),140000,0.98,0.0,1
+Reward Shaped (Human),150000,0.96,0.0,1
+Sparse,10000,0.0,0.0,1
+Sparse,20000,0.0,0.0,1
+Sparse,30000,0.0,0.0,1
+Sparse,40000,0.0,0.0,1
+Sparse,50000,0.0,0.0,1
+Sparse,60000,0.02,0.0,1
+Sparse,70000,0.06,0.0,1
+Sparse,80000,0.08,0.0,1
+Sparse,90000,0.08,0.0,1
+Sparse,100000,0.44,0.0,1
+Sparse,110000,0.54,0.0,1
+Sparse,120000,0.56,0.0,1
+Sparse,130000,0.72,0.0,1
+Sparse,140000,0.84,0.0,1
+Sparse,150000,0.8,0.0,1

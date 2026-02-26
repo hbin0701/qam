@@ -43,6 +43,40 @@ def add_to(dict_of_lists, single_dict):
         dict_of_lists[k].append(v)
 
 
+def _extract_object_pose_snapshot(env, observation=None, qpos=None):
+    """Extract cube/gripper poses for logging per rendered frame."""
+    try:
+        if qpos is None:
+            qpos = env.unwrapped._data.qpos.copy()
+        qpos = np.asarray(qpos, dtype=np.float64)
+    except Exception:
+        return None
+
+    # OGBench manipspace qpos convention for cube tasks:
+    # [0:7] robot + gripper, then per-cube blocks of 7 (xyz + quat).
+    objects = {}
+    idx = 7
+    cube_idx = 0
+    while idx + 6 < len(qpos):
+        pos = qpos[idx:idx + 3]
+        quat = qpos[idx + 3:idx + 7]
+        objects[f"cube_{cube_idx}"] = {
+            "pos": [float(pos[0]), float(pos[1]), float(pos[2])],
+            "quat": [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])],
+        }
+        cube_idx += 1
+        idx += 7
+
+    snapshot = {"objects": objects}
+    if observation is not None:
+        try:
+            gp = extract_gripper_pos(observation)
+            snapshot["gripper_pos"] = [float(gp[0]), float(gp[1]), float(gp[2])]
+        except Exception:
+            pass
+    return snapshot
+
+
 @contextmanager
 def _render_lock_if_needed():
     """Serialize EGL rendering on the same GPU across processes.
@@ -119,16 +153,17 @@ def evaluate(
     render_gripper_width_traces = []
     render_left_gripper_cube_dist_traces = []
     render_right_gripper_cube_dist_traces = []
-    gripper_metric_name = "gripper_gap_m" if (dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v20", "v21", "v22", "v23")) else "gripper_width"
+    gripper_metric_name = "gripper_gap_m" if (dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30")) else "gripper_width"
     render_frame_steps = []
+    render_object_pose_traces = []
     progress_video_enabled = (
         dense_wrapper is not None
-        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23")
+        and getattr(dense_wrapper, "version", None) in ("v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30")
     )
-    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23")
-    z_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23")
-    lift_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23")
-    dist_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v20", "v21", "v22", "v23")
+    v8_chunk_shaping = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v8", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30")
+    z_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30")
+    lift_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30")
+    dist_trace_enabled = dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30")
     saved_episode_init_positions = None
     if dense_wrapper is not None:
         saved_episode_init_positions = getattr(dense_wrapper, "episode_init_positions", None)
@@ -175,6 +210,7 @@ def evaluate(
         step = 0
         render = []
         render_steps = []
+        object_pose_trace = []
         reward_trace = []
         chunk_reward_trace = []
         progress_trace = []
@@ -209,7 +245,7 @@ def evaluate(
                     chunk_start_gripper_gap_dense = prev_gripper_gap_dense
                     chunk_start_left_gripper_pos_dense = None if prev_left_gripper_pos_dense is None else prev_left_gripper_pos_dense.copy()
                     chunk_start_right_gripper_pos_dense = None if prev_right_gripper_pos_dense is None else prev_right_gripper_pos_dense.copy()
-                    if getattr(dense_wrapper, "version", None) in ("v22", "v23"):
+                    if getattr(dense_wrapper, "version", None) in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30"):
                         chunk_start_best_progress_dense = getattr(dense_wrapper, "_v22_best_progress", None)
                     else:
                         chunk_start_best_progress_dense = None
@@ -285,7 +321,7 @@ def evaluate(
                                     left_gripper_pos=chunk_start_left_gripper_pos_dense,
                                     right_gripper_pos=chunk_start_right_gripper_pos_dense,
                                 )
-                            if getattr(dense_wrapper, "version", None) in ("v22", "v23"):
+                            if getattr(dense_wrapper, "version", None) in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30"):
                                 start_best = chunk_start_best_progress_dense
                                 end_best = getattr(dense_wrapper, "_v22_best_progress", None)
                                 effective_prev_progress = max(
@@ -436,7 +472,7 @@ def evaluate(
                     else:
                         cube = lift_env.cubes[active_idx]
                         cube_lift = float(cube.position[2] - cube.initial_position[2])
-                    if dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v20", "v21", "v22", "v23"):
+                    if dense_wrapper is not None and getattr(dense_wrapper, "version", None) in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30"):
                         gripper_width = float(gap_for_lift) if gap_for_lift is not None else np.nan
                     else:
                         gripper_width = float(lift_env.gripper_width)
@@ -490,6 +526,17 @@ def evaluate(
                         frame = env.render().copy()
                     render.append(frame)
                     render_steps.append(step - 1)
+                    pose_snapshot = _extract_object_pose_snapshot(
+                        env,
+                        observation=next_observation,
+                        qpos=curr_qpos_dense if curr_qpos_dense is not None else None,
+                    )
+                    object_pose_trace.append(
+                        {
+                            "step": int(step - 1),
+                            "pose": pose_snapshot,
+                        }
+                    )
                 except Exception as e:
                     # Keep training/eval alive when EGL offscreen rendering is unavailable.
                     render_disabled = True
@@ -561,6 +608,7 @@ def evaluate(
                         },
                     )
             render_frame_steps.append(np.array(render_steps, dtype=np.int32))
+            render_object_pose_traces.append(object_pose_trace)
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
@@ -582,5 +630,6 @@ def evaluate(
         "left_gripper_cube_dist_traces": render_left_gripper_cube_dist_traces,
         "right_gripper_cube_dist_traces": render_right_gripper_cube_dist_traces,
         "frame_steps": render_frame_steps,
+        "object_pose_traces": render_object_pose_traces,
     }
     return stats, trajs, renders, render_data

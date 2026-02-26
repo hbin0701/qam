@@ -1,0 +1,22 @@
+```json
+{
+  "task": "double-cube-play-task2",
+  "active_cube_rule_summary": "The active cube (C) is the one currently grasped. If no cube is grasped, C is the unplaced cube (i.e., 'C_placed_and_released' event has not fired) closest to the end-effector. If both cubes are placed, no active cube.",
+  "stages": [
+    {
+      "id": "S0",
+      "name": "Grasp Active Cube",
+      "observable_signals": [
+        "robot_eef_pos",
+        "active_cube_pos",
+        "gripper_open_state",
+        "is_grasping_active_cube",
+        "active_cube_placed_and_released_event_fired"
+      ],
+      "condition": {
+        "entry": "dist_eef_to_active_cube < 0.05 AND is_grasping_active_cube is false AND active_cube_placed_and_released_event_fired is false",
+        "exit": "is_grasping_active_cube is true"
+      },
+      "hysteresis": "dist_eef_to_active_cube must be < 0.04 to re-enter if exited by moving away from the cube.",
+      "one_shot_event": {
+        "name": "active_cube_grasped",
